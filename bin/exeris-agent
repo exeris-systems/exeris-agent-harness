@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# The CLI is the first client of the harness and holds no logic of its own: this file puts the
+# checkout on the import path so that a clone anywhere on disk runs without being installed, and
+# hands over.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PYTHONPATH="${here}${PYTHONPATH:+:${PYTHONPATH}}" exec python3 -m harness.cli "$@"

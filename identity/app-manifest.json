@@ -1,0 +1,18 @@
+{
+  "name": "exeris-agent",
+  "url": "https://github.com/exeris-systems/exeris-agent-harness",
+  "description": "The organisation's execution identity: the principal that commits and opens pull requests for work an agent carried out in a harness run. Published so that another organisation can instantiate its own.",
+  "public": false,
+  "request_oauth_on_install": false,
+  "setup_on_update": false,
+  "hook_attributes": {
+    "url": "https://github.com/exeris-systems/exeris-agent-harness",
+    "active": false
+  },
+  "default_events": [],
+  "default_permissions": {
+    "contents": "write",
+    "pull_requests": "write",
+    "metadata": "read"
+  }
+}
