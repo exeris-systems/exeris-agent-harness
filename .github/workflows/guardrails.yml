@@ -1,0 +1,154 @@
+# Copy to <repo>/.github/workflows/guardrails.yml — the whole per-repo footprint of ADR-085 §C.11.
+name: guardrails
+on:
+  pull_request:
+    # labeled/unlabeled matter: adr-conventions rule 9 requires the `adr` label on a PR that
+    # amends an ADR, so adding the label after a red run has to re-run the gate.
+    types: [opened, edited, synchronize, ready_for_review, labeled, unlabeled]
+concurrency:
+  group: guardrails-${{ github.event.pull_request.number }}
+  # Not `true`: when the review publishes it removes the review label, and that removal is an
+  # `unlabeled` event whose run would cancel the run still publishing. Bot-triggered runs queue
+  # instead of cancelling; human pushes still collapse. Measured on exeris-systems/.github#35, where
+  # the cancel arrived in the same second the publishing job finished.
+  cancel-in-progress: ${{ !endsWith(github.actor, '[bot]') }}
+# A called workflow can only narrow the caller's permissions, never raise them, so this block must
+# be the UNION of what every job below declares. It is not a wish list and it is not a minimum:
+# omitting a permission one called workflow declares does not run that job with less, it makes the
+# whole file an invalid workflow — "requesting 'issues: read, id-token: write', but is only allowed
+# 'issues: none, id-token: none'", which is how exeris-kernel's first adoption of this file failed.
+#
+# Granting them here does not widen docs-lint, commit-lint or pr-body-check: each called workflow's
+# jobs receive what its own permissions block declares, capped by this one. The last two belong to
+# docs-review — `id-token: write` for the OIDC exchange claude-code-action performs, `issues: read`
+# so the routine can see the debt issues of issue-conventions.md rule 6. Drop the `docs-review` job
+# and you may drop them with it.
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  id-token: write
+
+jobs:
+  docs:
+    uses: exeris-systems/.github/.github/workflows/docs-lint.yml@main
+    with:
+      mode: ramp                # switch to strict per repo once the frontmatter backfill has landed
+      section-check: false      # enable after subsystem/module pages carry the required sections
+      # No path list: docs-lint reads the whole repository and skips what is not documentation
+      # (generated output, agent trees, "_"-prefixed working directories). Name a path here only
+      # to take something out — a vendored tree, say:
+      # exclude: "docs/vendor"
+  commits:
+    uses: exeris-systems/.github/.github/workflows/commit-lint.yml@main
+  pr-body:
+    uses: exeris-systems/.github/.github/workflows/pr-body-check.yml@main
+  # The L2 review of ADR-085 §J.33, published under the organisation's identity by ADR-087 §B.
+  # Without this job the routine runs only in Cowork sessions and never on a pull request.
+  #
+  # ONE JOB BY DEFAULT: `produce` runs the model and posts its review, exactly as before the split.
+  # Publication is opt-in (`publish: true` below), and until you turn it on nothing is labelled and
+  # nothing is gated — which is deliberate, because whether the runner writes a verdict file at all
+  # is ADR-087 Engineering Protocol 4's open question and `exeris-systems/.github` answers it on
+  # itself first.
+  #
+  # With `publish: true` a second job appears and IS THE REQUIRED CHECK — red when the verdict is
+  # absent, invalid, BLOCKED, or rests on a mandatory gate that did not run. The produce job is
+  # never the required one, because a review that crashed has to reach the step that notices.
+  #
+  # THE CHECK NAME THEN HAS THREE SEGMENTS, because the publish half is its own reusable workflow:
+  # `docs-review / publish / verdict`. CONFIRM IT AGAINST A REAL RUN before adding it to a branch
+  # protection rule — a required check whose name does not exist never reports, and a pull request
+  # waiting on one can never merge. Without `publish: true` the only check this job contributes is
+  # `docs-review / produce`.
+  #
+  # Secrets are named rather than inherited, matching exeris-kernel and exeris-sdk, which both
+  # refused `secrets: inherit` under SonarCloud S7631. The two EXERIS_BOT_* lines are optional: drop
+  # them and the review still runs, it is simply not published under the organisation's identity
+  # and no label moves — and with `publish: true` but no secrets, the gate still decides while
+  # nothing is posted. The permission block above does not grow either way
+  # — every write goes through the App's installation token, so neither job's own GITHUB_TOKEN holds
+  # one (ADR-087 §B.5).
+  # `needs` puts the review after the gates it is meant to complement, and `l1-results` hands it
+  # their conclusions. Without the second, the reviewer tries to read a CI step summary, its harness
+  # denies the network call, and every mandatory gate lands in the verdict as `not-run` — which the
+  # publish step correctly turns red, for ever, on every pull request.
+  # THE REVIEW RUNS ON READINESS, not on every push: when the pull request is opened, reopened,
+  # marked ready for review, or labelled `needs-l2-review` by a human. A push afterwards does not
+  # start a new one — it leaves the standing verdict visibly covering an older commit, and the
+  # required check goes red saying so until a review is asked for again. That is deliberate: a
+  # verdict is about the tree it read, and a green check resting on a review of code that is gone is
+  # worse than a red one.
+  docs-review:
+    needs: [docs, commits, pr-body]
+    #
+    # AND NOT FOR A BOT'S OWN EVENT. `claude-code-action` refuses a non-human actor, so a run this
+    # job starts under one can never perform the review it exists for: it spends a runner, reports
+    # a check that repeats what the last one said, and leaves a log that reads like a failure. The
+    # publication applies labels, so without this the bot wakes this workflow on its own account
+    # every time it does.
+    #
+    # `always()` still stands for every human-initiated event: a review that vanishes from the
+    # checks because its gates went red is the failure mode this file exists to prevent. This is
+    # narrower -- the event, not the outcome -- and the last check-run on the commit keeps standing
+    # when it fires, because a skipped job publishes nothing and replaces nothing.
+    if: ${{ always() && github.event.sender.type == 'User' }}
+    uses: exeris-systems/.github/.github/workflows/docs-review.yml@main
+    with:
+      l1-results: >-
+        {"docs-lint": "${{ needs.docs.result }}",
+         "commit-lint": "${{ needs.commits.result }}",
+         "pr-body-check": "${{ needs.pr-body.result }}"}
+    secrets:
+      claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      exeris_bot_app_id: ${{ secrets.EXERIS_BOT_APP_ID }}
+      exeris_bot_private_key: ${{ secrets.EXERIS_BOT_PRIVATE_KEY }}
+    # with:
+    #   # PUBLICATION IS OFF BY DEFAULT. Turn it on once `exeris-systems/.github` has run the review
+    #   # on itself and answered ADR-087 Engineering Protocol 4 — whether the runner writes a
+    #   # verdict file, and what identity it posts under. Until then this job produces a review and
+    #   # publishes nothing, which is what it did before the split.
+    #   publish: true
+    #   # Which runner produces the verdict. One value is supported today; it is recorded, never
+    #   # selected — ADR-087 §B.12.
+    #   runner: claude-code-action
+    #   # L1 gates whose `not-run` makes the required check red, beyond the routine's own three
+    #   # (docs-lint, commit-lint, pr-body-check). Name a repo's own mandatory gates here.
+    #   mandatory-gates: "docs-lint,commit-lint,pr-body-check,javadoc-gate"
+    #   # THIS REPOSITORY'S OWN REVIEW RULES, if it has any. The point of these two is that having
+    #   # rules of your own is no longer a reason to keep a review workflow of your own — which is
+    #   # how every repository ended up with a second verdict format, no required check and no
+    #   # provenance. The shared routine's `## Repository extension` section owns the limits: an
+    #   # extension adds checks and raises severities, it never lowers one, skips a step, or changes
+    #   # the output format.
+    #   repo-routine: .agents/workflows/docs-pr-review.md
+    #   # Scripts CI runs for the reviewer before the model starts, their output handed over as a
+    #   # file. CI runs them because the runner's harness denies Bash — asking the model to execute
+    #   # them gets a review that reports its own checks as `not-run`. A non-zero exit never fails
+    #   # the job: a candidate locator that found candidates is evidence, not a verdict.
+    #   # Separated by `;`, NOT by `&&`: a candidate locator exits non-zero when it FINDS
+    #   # something, so `&&` would stop the list at the first script that had anything to say.
+    #   repo-checks: .agents/scripts/drift-sweep.sh; .agents/scripts/taxonomy-check.sh
+  # javadoc:                    # JVM repos with a gated module only
+  #   uses: exeris-systems/.github/.github/workflows/javadoc-gate.yml@main
+  #   with:
+  #     # Gated in full — every file complies, always. Rule 11's exception: the surfaces a
+  #     # downstream implementor reads. These modules need java/javadoc-plugin-block.xml in
+  #     # their own pom.
+  #     modules: "exeris-kernel-spi,exeris-kernel-tck"
+  #     # Gated on the changed files of this pull request, which is what javadoc-conventions.md
+  #     # rule 11 says for Kernel Core, Community and tooling: no backfill mandate, but a file you
+  #     # touch has to comply. Needs no pom change, so a module can go under the gate long before
+  #     # it is clean.
+  #     diff-modules: "exeris-kernel-core,exeris-kernel-community"
+  #     # Built so the gated modules compile, never audited. `-am` cannot find these: an annotation
+  #     # processor reaches its consumer through <annotationProcessorPaths>, which is not a reactor
+  #     # edge, so the install step dies on a missing artifact unless the module is named here.
+  #     # build-modules: "exeris-sdk-annotation-catalog"
+  # tsdoc:                      # TypeScript packages only — ONE JOB PER PACKAGE, the gate's unit is a package
+  #   uses: exeris-systems/.github/.github/workflows/tsdoc-gate.yml@main
+  #   # The three targets and the settings each one takes. `typedoc` and `api-report` stay off until
+  #   # that package commits the config and the golden they read; the lint half runs from day one.
+  #   with: { package-dir: ".", typedoc: true, api-report: "mcp-tool-surface" }                 # exeris-ai-bridge
+  #   with: { package-dir: "exeris-sdk-ui-kit", typedoc: true, api-report: "api-extractor" }    # exeris-sdk
+  #   with: { package-dir: "exeris-codegen-ts", typedoc: true }                                 # exeris-tooling
