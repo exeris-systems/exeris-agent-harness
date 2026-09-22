@@ -22,6 +22,13 @@ files below, the file would be right.
 Where the App is installed is the third part, and it is an installation choice rather than a file:
 never on the repositories that hold run records, because the hands do not hold the pen.
 
+That is why the harness's own records do not reach the inbox under this identity. A run closes as
+the identity — its branch is pushed and its draft pull request opened with the token the run minted
+— and the records it staged are carried in afterwards by a person, under their own credential. The
+pull request that carries a batch is that person's sign-off on it, and the validator has already
+run before it is opened. A harness that reached the inbox with the identity's own token would be
+the hands holding the pen, which is the one arrangement this split exists to prevent.
+
 ## Key custody, and what V0's relaxation costs
 
 The private key should be encrypted at rest — the harness reads a `.age` path through a pipe when

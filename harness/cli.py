@@ -1,23 +1,37 @@
 """`exeris-agent` — the first client of the harness, and in V0 the only one.
 
-The command a person types is `open-run`; everything else in V0 exists so that what `open-run`
-produced can be found again. The two lines it prints are the whole handover: source the run's
-environment, change into the run's worktree, and the shell — and anything launched from it — is the
-execution identity's, inside the tree that is the run's attribution boundary.
+Three commands carry a run from end to end, and the identity each runs under is the point of the
+split.
 
-`close-run` and `flush` are registered here and refuse. A subcommand that exists and says it is not
-in this version is honest about the shape of the contract; one that is missing makes a person guess
-whether they mistyped it.
+`open-run` binds a worktree to the execution identity and prints the two lines that hand the shell
+over. `close-run` ends that run *as the identity*: it pushes the run's branch and opens its draft
+pull request with the identity's own token, then writes the run record to the run's staging
+directory. `flush` carries those records into the inbox **as the person**, under their own `gh` and
+their own git, because the inbox is where the organisation's own pen writes and the hands are
+deliberately not installed there. A person opening that pull request is a sign-off on a batch of
+rows, not a fallback credential for the runs it describes — so everything a run bound to the shell
+is taken out of the environment first, and a shell still bound to one is refused.
+
+Between them sits a rule neither command breaks: a value the run could not establish is not
+defaulted. `close-run` pushes and opens the pull request either way, and where the record cannot be
+assembled it writes no row and names the reason, which is counted rather than repaired.
 """
 
 import argparse
 import datetime
 import hashlib
+import importlib
 import json
 import os
+import shutil
 import sys
+import tempfile
 
-from . import ROOT, VERSION, config, runstate, token, ulid, worktree
+from . import ROOT, VERSION, capture, config, record, runstate, token, ulid, worktree
+# Bound here rather than used through the module, because this name is the seam: everything that
+# reaches git or the forge is constructed from it, so substituting it substitutes both halves at
+# once and a test can replace the forge while keeping git.
+from .runner import CommandError, GhError, Runner
 
 PROVIDERS = ("claude", "codex", "gemini")
 
@@ -251,9 +265,667 @@ def cmd_status(args) -> int:
     return EXIT_OK
 
 
-def cmd_not_in_this_version(args) -> int:
-    print(f"{args.command}: not in this version", file=sys.stderr)
-    return EXIT_REFUSED
+#: The agent file whose content is part of what a run was instructed by. It is read at the commit
+#: the run started from, not from the tree as it stands: a run that edited it was subject to what
+#: it found, and a hash taken afterwards would record what the run wrote rather than what it read.
+AGENTS_FILE = "AGENTS.md"
+
+#: The producer's own note beside a run's staged records. It is not a record and nothing reads it
+#: as one; it is what makes closing a run once observable, so that a second close cannot push a
+#: second time or ask for a second pull request.
+CLOSED = "closed.json"
+
+
+def _run_environment(run_dir: str, manifest: dict, cfg) -> dict:
+    """The environment the run's own calls are made in — the one `open-run` printed.
+
+    Reconstructed rather than remembered: the token is the file the mint wrote, and the rest is the
+    same mapping the env file exports. What the person's shell carried is dropped first, because a
+    variable the harness never sets is a variable the harness never closed.
+    """
+    try:
+        with open(os.path.join(run_dir, "token"), encoding="utf-8") as handle:
+            minted = handle.read().splitlines()[0].strip()
+    except (OSError, IndexError):
+        minted = ""
+    if not minted:
+        raise Refused(f"run {manifest['run_id']} has no token; it cannot act as the identity")
+    environment = {key: value for key, value in os.environ.items() if key not in runstate.UNSET}
+    environment.update(runstate.env_values(run_dir, run_id=manifest["run_id"], token=minted,
+                                           user_name=cfg.bot_login,
+                                           user_email=cfg.noreply_email))
+    return environment
+
+
+def _adapter(provider: str):
+    """The provider's session adapter, or nothing where the checkout carries none."""
+    try:
+        return importlib.import_module(f"adapters.{provider}.session")
+    except ImportError:
+        return None
+
+
+def _at_commit(net, worktree_path: str, commit: str, path: str, *, reason: str) -> str | None:
+    """A file as it stood at a commit, byte for byte, or nothing where that tree does not hold it.
+
+    The two answers one failing `git show` cannot tell apart are separated here. A path the tree
+    does not list is a state the record hashes: a checkout with no agent file was instructed by an
+    empty one. A path the tree does list and the object store cannot produce, or a commit that does
+    not resolve at all, is a component the producer cannot recover exactly — and a component
+    recovered inexactly is a hash of something else, so it yields no row rather than an empty
+    string.
+    """
+    try:
+        net.git(worktree_path, "rev-parse", "--verify", f"{commit}^{{commit}}")
+        listed = net.git(worktree_path, "ls-tree", "--name-only", commit, "--", path)
+    except CommandError as exc:
+        raise capture.NoRow(reason, str(exc)) from None
+    if not listed.strip():
+        return None
+    try:
+        return net.git_raw(worktree_path, "show", f"{commit}:{path}")
+    except CommandError as exc:
+        raise capture.NoRow(reason, str(exc)) from None
+
+
+def _visibility(net, repo: str, environment: dict) -> str:
+    """The repository's visibility in ADR-020's taxonomy, fail-closed.
+
+    Only an answer that says public becomes `public`; everything else — private, internal, and a
+    visibility the producer could not establish at all — becomes `enterprise-private`. The rule
+    runs one way only, because a row published under the wrong visibility is published by the act
+    of filing it and no later correction un-publishes it.
+    """
+    try:
+        answer = net.api(f"repos/{repo}", env=environment)
+    except (GhError, CommandError, OSError):
+        return "enterprise-private"
+    value = answer.get("visibility") if isinstance(answer, dict) else None
+    return "public" if str(value).lower() == "public" else "enterprise-private"
+
+
+def _title(net, worktree_path: str, commits: list, run_id: str) -> str:
+    """The pull request's title: the run's first commit subject, which is already in the grammar."""
+    if commits:
+        subject = net.git(worktree_path, "log", "-1", "--format=%s", commits[0])
+        if subject:
+            return subject
+    return f"chore(agent): run {ulid.short(run_id)}"
+
+
+def _row(args, cfg, net, manifest, *, worktree_path, visibility, dirty, commits,
+         ended_at) -> tuple[dict | None, str | None, str | None]:
+    """`(row, session path, reason)` — the run record, or why there is not one.
+
+    Every refusal reaches here as `NoRow` and leaves as a reason, because a run that cannot be
+    recorded is not a run that failed: its commits are pushed and its pull request is open, and
+    what is missing is the observation.
+    """
+    try:
+        module = _adapter(manifest["provider"])
+        if module is None:
+            raise capture.NoRow("adapter-identity-only", manifest["provider"])
+        session = module.locate(manifest, override=args.session)
+        # An adapter with no search to make answers the pair rather than raising, because it has
+        # nothing to have failed at: there is no log it has ever read.
+        if not isinstance(session, str):
+            named = session[1] if isinstance(session, (tuple, list)) and len(session) > 1 else None
+            raise capture.NoRow(named or "adapter-identity-only")
+        facts = module.read(session)
+
+        repo_config = cfg.repo(manifest["repo"].split("/", 1)[1])
+        routine = ""
+        if repo_config.routine:
+            found = _at_commit(net, worktree_path, manifest["base_sha"], repo_config.routine,
+                               reason="routine-unreadable")
+            if found is None:
+                raise capture.NoRow("routine-unreadable", repo_config.routine)
+            routine = found
+        # A checkout with no agent file is a checkout whose agent instructions are empty. That is a
+        # state the hash records, not a component it could not recover.
+        agents_file = _at_commit(net, worktree_path, manifest["base_sha"], AGENTS_FILE,
+                                 reason="agents-file-unreadable") or ""
+
+        bundle = record.bundle_version(
+            _at_commit(net, worktree_path, manifest["base_sha"], record.BUNDLE_MANIFEST,
+                       reason="bundle-manifest-unreadable"))
+        date = record.date_of(manifest["started_at"])
+        row = record.assemble(
+            manifest=manifest,
+            repo_config=repo_config,
+            facts=facts,
+            visibility=visibility,
+            bundle=bundle,
+            dirty=dirty,
+            result_commits=commits,
+            ended_at=ended_at,
+            capture_version=record.capture_version(cfg.execution_repo_path or ""),
+            # Resolved in the register the contract publishes, never minted from this run's own
+            # date: an id no entry carries is a mark nobody can say they are on the far side of.
+            fence=record.fence(cfg.execution_repo_path or "", manifest["provider"],
+                               facts["version"]),
+            ref=record.stream_ref(cfg.org, os.path.basename(cfg.streams_repo_path or ""), date,
+                                  manifest["repo"].split("/", 1)[1], manifest["run_id"]),
+            # The prompt as it was passed, where the run was given one, and otherwise the prompt
+            # the session opened with. Either way it is a digest by the time it reaches here: the
+            # text was hashed where it was read.
+            prompt_digest=manifest.get("prompt_sha256") or facts.get("system_prompt_sha256") or "",
+            routine=routine,
+            agents_file=agents_file,
+        )
+        return row, session, None
+    except capture.NoRow as refusal:
+        return None, None, refusal.reason
+
+
+def cmd_close_run(args) -> int:
+    cfg = config.load()
+    if not ulid.is_ulid(args.run):
+        raise Refused(f"--run {args.run!r} is not a run id")
+    run_dir = runstate.path(args.run)
+    manifest = runstate.read_manifest(run_dir)
+    if manifest is None:
+        raise Refused(f"no run {args.run} under {runstate.runs_root()}")
+    staging = os.path.join(run_dir, "staging")
+    if os.path.exists(os.path.join(staging, CLOSED)):
+        raise Refused(f"{args.run} was closed already; what it staged is under {staging}")
+    if not cfg.owner_login:
+        raise Refused(f"{cfg.path} declares no owner_login; a pull request this run's work becomes "
+                      f"carries exactly one `Owner:` and this is where it comes from")
+
+    net = Runner()
+    worktree_path = manifest["worktree"]
+    if not os.path.isdir(worktree_path):
+        raise Refused(f"the worktree of {args.run} is gone: {worktree_path}")
+    environment = _run_environment(run_dir, manifest, cfg)
+
+    ended_at = _now()
+    manifest = dict(manifest, ended_at=ended_at)
+    run_id, repo, branch = manifest["run_id"], manifest["repo"], manifest["branch"]
+
+    dirty = bool(net.git(worktree_path, "status", "--porcelain"))
+    commits = net.git_lines(worktree_path, "rev-list", "--reverse",
+                            f"{manifest['base_sha']}..HEAD")
+    # A commit the hook did not stamp is a commit the record cannot claim: the trailer is the only
+    # link from the commit graph back to the run that produced it, so one without it is counted
+    # rather than adopted.
+    trailer = f"Exeris-Run: {run_id}"
+    unattributed = [sha for sha in commits
+                    if trailer not in net.git(worktree_path, "log", "-1", "--format=%B", sha)]
+    if unattributed:
+        print(f"exeris-agent: {len(unattributed)} unattributed-commit on {branch} — no "
+              f"`{trailer}` trailer: {', '.join(sha[:8] for sha in unattributed)}", file=sys.stderr)
+
+    net.git(worktree_path, "push", "origin", f"HEAD:refs/heads/{branch}", env=environment)
+
+    pull_request = None
+    if not args.no_pr:
+        answer = net.api(f"repos/{repo}/pulls", method="POST", env=environment, body={
+            "title": args.title or _title(net, worktree_path, commits, run_id),
+            "head": branch,
+            "base": worktree.default_branch(worktree_path),
+            "body": record.pull_request_body(cfg.owner_login, run_id),
+            # A draft, always. A human marks it ready, and that is the moment a person takes on
+            # what the run produced; opening it ready would make the identity's own push the
+            # readiness event.
+            "draft": True,
+        })
+        pull_request = (answer or {}).get("html_url") if isinstance(answer, dict) else None
+
+    visibility = _visibility(net, repo, environment)
+    row, session, reason = _row(args, cfg, net, manifest, worktree_path=worktree_path,
+                                visibility=visibility, dirty=dirty, commits=commits,
+                                ended_at=ended_at)
+
+    date = record.date_of(manifest["started_at"])
+    os.makedirs(staging, mode=runstate.DIR_MODE, exist_ok=True)
+    if row is not None:
+        # The stream is copied rather than referenced: the client's own log is the person's and may
+        # be rotated or removed, and the row's digest has to keep naming something that exists.
+        stream = os.path.join(staging, "streams", date, repo.split("/", 1)[1], f"{run_id}.jsonl")
+        os.makedirs(os.path.dirname(stream), exist_ok=True)
+        shutil.copyfile(session, stream)
+        record.write(os.path.join(staging, visibility, "inbox", date, "runs", f"{run_id}.json"),
+                     row)
+        print(f"exeris-agent: {run_id} staged as a {visibility} row")
+    else:
+        print(f"exeris-agent: no row for {run_id}: {reason}", file=sys.stderr)
+
+    runstate.write_text(run_dir, os.path.join("staging", CLOSED), json.dumps({
+        "run_id": run_id,
+        "ended_at": ended_at,
+        "visibility": visibility,
+        "row": row is not None,
+        "reason": reason,
+        "pull_request": pull_request,
+        "unattributed_commits": len(unattributed),
+    }, indent=2, sort_keys=True) + "\n")
+
+    if pull_request:
+        print(pull_request)
+    if args.remove_worktree:
+        _remove_worktree(net, worktree_path, dirty)
+    return EXIT_OK
+
+
+def _remove_worktree(net, worktree_path: str, dirty: bool) -> None:
+    """Give the run's tree back to the clone. Never while it holds uncommitted work."""
+    if dirty:
+        print(f"exeris-agent: {worktree_path} has uncommitted changes and is kept", file=sys.stderr)
+        return
+    common = net.git(worktree_path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    clone = os.path.dirname(common.rstrip("/"))
+    net.git(clone, "worktree", "remove", worktree_path)
+
+
+def _staged(kind: str):
+    """Every staged artefact of `kind` across the runs on this machine, oldest run first."""
+    for run_dir in runstate.all_runs():
+        base = os.path.join(run_dir, "staging", kind)
+        for here, _dirs, names in sorted(os.walk(base)):
+            for name in sorted(names):
+                yield run_dir, os.path.join(here, name)
+
+
+def _staged_rows() -> list[dict]:
+    """The rows waiting in staging: where each is, whose inbox it belongs in, and its date."""
+    out = []
+    for visibility in ("public", "enterprise-private"):
+        for run_dir, path in _staged(os.path.join(visibility, "inbox")):
+            parts = path.split(os.sep)
+            if len(parts) < 3 or parts[-2] != "runs" or not path.endswith(".json"):
+                continue
+            out.append({"run_dir": run_dir, "path": path, "visibility": visibility,
+                        "date": parts[-3], "run_id": os.path.basename(path)[:-len(".json")]})
+    return out
+
+
+def _staged_streams() -> list[dict]:
+    """The session streams waiting in staging, with the repository and date they file under."""
+    out = []
+    for run_dir, path in _staged("streams"):
+        parts = path.split(os.sep)
+        if len(parts) < 3 or not path.endswith(".jsonl"):
+            continue
+        out.append({"run_dir": run_dir, "path": path, "date": parts[-3], "repo": parts[-2],
+                    "run_id": os.path.basename(path)[:-len(".jsonl")]})
+    return out
+
+
+def _repositories(rows: list) -> list[str]:
+    """Which repositories a batch of rows came from, for the pull request that carries them."""
+    out = []
+    for row in rows:
+        try:
+            with open(row["path"], encoding="utf-8") as handle:
+                found = (json.load(handle).get("repository_state") or {}).get("repository")
+        except (OSError, json.JSONDecodeError, AttributeError):
+            continue
+        if found:
+            out.append(str(found))
+    return out
+
+
+def _clone(cfg, attribute: str, what: str) -> str:
+    configured = getattr(cfg, attribute)
+    if not configured:
+        raise Refused(f"{cfg.path} declares no {attribute}; {what}")
+    if not worktree.is_clone(configured):
+        raise Refused(f"{configured} is not a git repository; {attribute} is a local clone")
+    return configured
+
+
+def _carry_streams(net, streams: str, rows: list, staged: list, env=None) -> str:
+    """Copy the streams in, append the index, commit, push, and answer with the commit.
+
+    A stream is content rather than a record: it goes to its own repository, on its main branch,
+    because the row that references it is useless until the reference resolves and a pull request
+    would leave it dangling until somebody merged. Nothing here is rewritten — a stream already
+    carried is left where it is, and its index entry is not written twice.
+    """
+    known_rows = {}
+    for row in rows:
+        try:
+            with open(row["path"], encoding="utf-8") as handle:
+                known_rows[row["run_id"]] = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+
+    index_path = os.path.join(streams, "index.json")
+    try:
+        with open(index_path, encoding="utf-8") as handle:
+            index = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        index = []
+    if not isinstance(index, list):
+        raise Refused(f"{index_path} is not a list of entries")
+    listed = {entry.get("run_id") for entry in index if isinstance(entry, dict)}
+
+    carried = 0
+    changed = False
+    for item in staged:
+        row = known_rows.get(item["run_id"])
+        if row is None:
+            continue
+        carried += 1
+        stream = (row.get("execution") or {}).get("event_stream") or {}
+        target = os.path.join(streams, "streams", item["date"], item["repo"],
+                              f"{item['run_id']}.jsonl")
+        if not os.path.exists(target):
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copyfile(item["path"], target)
+            changed = True
+        if item["run_id"] not in listed:
+            index.append({
+                "repo": item["repo"],
+                "run_id": item["run_id"],
+                "path": f"streams/{item['date']}/{item['repo']}/{item['run_id']}.jsonl",
+                "sha256": stream.get("sha256"),
+                "event_count": stream.get("event_count"),
+                # The session's own start, so that a stream carried in a later flush still files
+                # under the day it was produced.
+                "created_at": row.get("started_at"),
+                "producer": "harness",
+            })
+            listed.add(item["run_id"])
+            changed = True
+
+    if changed:
+        with open(index_path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(index, indent=2, sort_keys=True) + "\n")
+        branch = net.git(streams, "rev-parse", "--abbrev-ref", "HEAD", env=env)
+        net.git(streams, "add", "-A", ".", env=env)
+        net.git(streams, "commit", "-m",
+                f"feat(streams): {carried} harness session stream(s)", env=env)
+        net.git(streams, "push", "origin", f"HEAD:refs/heads/{branch}", env=env)
+    return net.git(streams, "rev-parse", "HEAD", env=env)
+
+
+def _stream_path(row: dict) -> str | None:
+    """The path inside the streams repository a row's own reference names."""
+    ref = ((row.get("execution") or {}).get("event_stream") or {}).get("ref")
+    if not isinstance(ref, str) or "/streams/" not in ref:
+        return None
+    return "streams/" + ref.split("/streams/", 1)[1].split("@", 1)[0]
+
+
+def _resolve_pending(rows: list, streams: str, sha: str) -> tuple[int, list]:
+    """Resolve each row's pending mark to the commit its own stream is in; answer the rest.
+
+    Staging is the producer's own, and the rule that a record is appended and never rewritten
+    begins where records are kept. A row that already names a commit is left alone: it names the
+    commit its own stream went in under, and a later flush's commit is not that one.
+
+    The mark is a claim about one file, so it is resolved one row at a time. A row whose stream
+    never reached the repository — removed from staging, or never copied there — keeps its mark and
+    stays behind: a reference that resolves to a path the commit does not carry is worse than one
+    that says it is still pending.
+    """
+    resolved, pending = 0, []
+    for row in rows:
+        try:
+            with open(row["path"], encoding="utf-8") as handle:
+                text = handle.read()
+            body = json.loads(text)
+        except (OSError, json.JSONDecodeError):
+            pending.append(row)
+            continue
+        if "@pending" not in text:
+            continue
+        inside = _stream_path(body)
+        if not inside or not os.path.exists(os.path.join(streams, inside)):
+            pending.append(row)
+            continue
+        with open(row["path"], "w", encoding="utf-8") as handle:
+            handle.write(text.replace("@pending", f"@{sha}"))
+        resolved += 1
+    return resolved, pending
+
+
+def _validate(execution: str, rows: list) -> int:
+    """Run the inbox's own validator over a temporary inbox holding exactly these rows.
+
+    The validator is imported from the contract repository rather than copied here: a second copy
+    is a second answer, and the one that matters is the one the inbox pull request will be judged
+    by. Schema conformance is checked beside it where a validator is installed, and is checkable
+    rather than checked where one is not — which is the validator's own stated split.
+    """
+    with tempfile.TemporaryDirectory(prefix="exeris-flush-") as root:
+        shutil.copytree(os.path.join(execution, "schemas"), os.path.join(root, "schemas"))
+        inbox = os.path.join(root, "inbox")
+        os.makedirs(inbox)
+        # The inbox's own identity, copied rather than written: rule 1 compares every row against
+        # the visibility the inbox declares, and a producer that supplied that value would be
+        # checking the rows against its own opinion and passing by construction.
+        try:
+            shutil.copyfile(os.path.join(execution, "inbox", "inbox.json"),
+                            os.path.join(inbox, "inbox.json"))
+        except OSError as exc:
+            raise Refused(f"{execution} declares no inbox identity ({exc}); the validator has "
+                          f"nothing to compare a row's visibility against") from None
+        for row in rows:
+            target = os.path.join(inbox, row["date"], "runs", f"{row['run_id']}.json")
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copyfile(row["path"], target)
+
+        tools = os.path.join(execution, "tools")
+        sys.path.insert(0, tools)
+        # Importing from a clone writes bytecode into it, and this clone is the one flush is about
+        # to commit from: a producer that leaves a file behind in the tree it commits either
+        # carries it in with the batch or refuses its own next run for a dirty tree.
+        writes_bytecode = sys.dont_write_bytecode
+        sys.dont_write_bytecode = True
+        try:
+            sys.modules.pop("inbox_validate", None)
+            inbox_validate = importlib.import_module("inbox_validate")
+        except ImportError as exc:
+            raise Refused(f"{tools} carries no inbox_validate: {exc}") from None
+        finally:
+            sys.dont_write_bytecode = writes_bytecode
+            if sys.path and sys.path[0] == tools:
+                sys.path.pop(0)
+
+        report = inbox_validate.Report()
+        notes = inbox_validate.check(root, report)
+        report.emit(notes)
+        bad = len(report.bad)
+        bad += _schema_errors(os.path.join(root, "schemas", "run-record.schema.json"), rows)
+        return bad
+
+
+def _schema_errors(schema_path: str, rows: list) -> int:
+    """Draft 2020-12 conformance, where a validator is installed."""
+    try:
+        import jsonschema
+    except ImportError:
+        print("exeris-agent: jsonschema is not installed; conformance is checkable, not checked",
+              file=sys.stderr)
+        return 0
+    with open(schema_path, encoding="utf-8") as handle:
+        validator = jsonschema.Draft202012Validator(json.load(handle))
+    bad = 0
+    for row in rows:
+        with open(row["path"], encoding="utf-8") as handle:
+            body = json.load(handle)
+        for error in sorted(validator.iter_errors(body), key=lambda e: list(e.absolute_path)):
+            where = "/".join(str(part) for part in error.absolute_path) or "<root>"
+            print(f"::error file={row['path']}::{where}: {error.message}")
+            bad += 1
+    return bad
+
+
+def _inbox_branch(net, execution: str, branch: str, env=None) -> str:
+    """Check the inbox branch out, creating it or continuing the one already open.
+
+    Fetch first and branch from the remote's own tip: a day's batch is appended to, and a branch
+    cut from a stale local copy would silently drop the rows an earlier flush put there.
+    """
+    start = net.git(execution, "rev-parse", "--abbrev-ref", "HEAD", env=env)
+    net.git(execution, "fetch", "origin", env=env)
+    if net.git(execution, "rev-parse", "--verify", "--quiet",
+               f"refs/remotes/origin/{branch}", env=env, check=False):
+        net.git(execution, "checkout", "-B", branch, f"origin/{branch}", env=env)
+    else:
+        net.git(execution, "checkout", "-B", branch,
+                f"origin/{worktree.default_branch(execution)}", env=env)
+    return start
+
+
+#: The prefix every inbox batch this producer opens is branched under. It is what a standing batch
+#: is recognised by, because the date after it is not what makes two branches one batch.
+INBOX_BRANCH = "inbox/harness/"
+
+
+def _today() -> str:
+    """The UTC day a new batch is cut under, where there is no standing one to add to."""
+    return datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d")
+
+
+def _person_environment() -> dict:
+    """The environment with everything a run bound to a shell taken out of it.
+
+    `flush` is the one command that acts as the person, and the terminal it is normally typed in is
+    the one the run was worked in — where `GH_TOKEN` is the identity's installation token and
+    `GIT_AUTHOR_NAME` is the identity's own name. Inherited, they would commit the rows and open
+    the batch's pull request as the identity whose runs the batch describes, which is the hands
+    holding the pen: the pull request would carry an application as its author, and the `Owner:`
+    line that arrangement requires is one this body is forbidden to carry.
+    """
+    return {key: value for key, value in os.environ.items()
+            if key not in runstate.RUN_ENV_KEYS}
+
+
+def _declared_visibility(execution: str) -> str:
+    """Which inbox this clone is, from the inbox's own `inbox.json`.
+
+    Declared by the inbox and never inferred from a directory name or a remote, because this is the
+    value every row's `repository_state.visibility` has to equal and the one mistake the inbox
+    says cannot be corrected afterwards is filing a row under the wrong one.
+    """
+    path = os.path.join(execution, "inbox", "inbox.json")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            declared = json.load(handle).get("visibility")
+    except (OSError, json.JSONDecodeError, AttributeError) as exc:
+        raise Refused(f"{path} does not say which inbox this is ({exc}); a batch is not filed in "
+                      f"an inbox whose visibility the producer had to guess") from None
+    if not isinstance(declared, str) or not declared:
+        raise Refused(f"{path} declares no visibility; a batch is not filed in an inbox whose "
+                      f"visibility the producer had to guess")
+    return declared
+
+
+def _standing_batch(net, slug: str, base: str, env=None) -> str | None:
+    """The head branch of the inbox batch already open, where there is one.
+
+    A batch is appended to rather than proposed twice, and the date in a branch name is not what
+    makes two branches one batch: a flush the day after a batch was opened, while that pull request
+    is still unmerged, would cut a fresh branch from the default, find the same rows missing there
+    and propose them again. So the open pull requests are asked for first and a standing one is
+    what the rows are added to.
+    """
+    answer = net.api(f"repos/{slug}/pulls?state=open&base={base}", env=env)
+    for pull in answer if isinstance(answer, list) else []:
+        ref = ((pull or {}).get("head") or {}).get("ref") if isinstance(pull, dict) else None
+        if isinstance(ref, str) and ref.startswith(INBOX_BRANCH):
+            return ref
+    return None
+
+
+def cmd_flush(args) -> int:
+    cfg = config.load()
+    net = Runner()
+    # A shell still bound to a run is not the person's, whatever the person typed into it. The run
+    # sets this variable and nothing else does, so it is the one part of the question that can be
+    # answered out loud; the environment below answers the rest by construction.
+    bound = os.environ.get("EXERIS_RUN")
+    if bound:
+        raise Refused(f"this shell is bound to run {bound}; flush is a person's sign-off on a "
+                      f"batch of rows and a shell holding a run's identity is not one — open a "
+                      f"shell that never sourced the run's env")
+    person = _person_environment()
+
+    execution = _clone(cfg, "execution_repo_path", "flush has no inbox to carry rows into")
+    streams = _clone(cfg, "streams_repo_path", "flush has nowhere to carry session streams")
+    for clone in (execution, streams):
+        if net.git(clone, "status", "--porcelain", env=person):
+            raise Refused(f"{clone} has uncommitted changes; flush commits into it and will not "
+                          f"carry somebody else's work in with a batch of rows")
+
+    declared = _declared_visibility(execution)
+
+    rows = _staged_rows()
+    if not rows:
+        print(f"no rows staged under {runstate.runs_root()}")
+        return EXIT_OK
+
+    sha = _carry_streams(net, streams, rows, _staged_streams(), env=person)
+    resolved, pending = _resolve_pending(rows, streams, sha)
+    print(f"exeris-agent: {len(rows)} row(s) staged; {resolved} stream reference(s) resolved "
+          f"to {sha[:8]}")
+    if pending:
+        # Counted and kept back rather than carried: the reference is what makes the row's counts
+        # checkable against the stream they were taken from, and one that names nothing is a row
+        # whose evidence cannot be found.
+        print(f"exeris-agent: {len(pending)} row(s) whose stream is not in the streams repository "
+              f"keep their pending reference and stay in staging", file=sys.stderr)
+    unresolved = {row["path"] for row in pending}
+    rows = [row for row in rows if row["path"] not in unresolved]
+
+    # The rows that travel are the ones whose visibility the inbox declares; the rest stay where
+    # they are, because filing one here would publish it by the act of filing.
+    carried = [row for row in rows if row["visibility"] == declared]
+    held = [row for row in rows if row["visibility"] != declared]
+    if held:
+        kinds = ", ".join(sorted({row["visibility"] for row in held}))
+        print(f"exeris-agent: {len(held)} row(s) stay in staging; this inbox declares {declared} "
+              f"and they are {kinds}")
+    if not carried:
+        return EXIT_OK
+
+    if _validate(execution, carried):
+        print(f"exeris-agent: the inbox validator is red over {len(carried)} staged row(s); "
+              f"nothing was committed and no pull request was opened", file=sys.stderr)
+        return EXIT_FAILED
+
+    today = _today()
+    slug = worktree.origin_slug(execution)
+    base = worktree.default_branch(execution)
+    standing = _standing_batch(net, slug, base, env=person)
+    branch = standing or f"{INBOX_BRANCH}{today}"
+    start = _inbox_branch(net, execution, branch, env=person)
+    try:
+        for row in carried:
+            target = os.path.join(execution, "inbox", row["date"], "runs",
+                                  f"{row['run_id']}.json")
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copyfile(row["path"], target)
+        net.git(execution, "add", "-A", "inbox", env=person)
+        if net.git(execution, "diff", "--cached", "--name-only", env=person):
+            net.git(execution, "commit", "-m",
+                    f"feat(inbox): {len(carried)} harness rows on {today}", env=person)
+            net.git(execution, "push", "origin", f"HEAD:refs/heads/{branch}", env=person)
+        ahead = net.git_lines(execution, "rev-list", f"origin/{base}..HEAD", env=person)
+        if not ahead:
+            print(f"exeris-agent: {branch} carries nothing the default branch does not; no pull "
+                  f"request was opened")
+            return EXIT_OK
+        if standing:
+            print(f"exeris-agent: {branch} already has an open pull request; the rows were added "
+                  f"to it")
+            return EXIT_OK
+        answer = net.api(f"repos/{slug}/pulls", method="POST", env=person, body={
+            "title": f"feat(inbox): {len(carried)} harness rows on {today}",
+            "head": branch,
+            "base": base,
+            "body": record.inbox_pull_request_body(len(carried), today, _repositories(carried)),
+        })
+        url = (answer or {}).get("html_url") if isinstance(answer, dict) else None
+        if url:
+            print(url)
+    finally:
+        net.git(execution, "checkout", start, env=person, check=False)
+    return EXIT_OK
 
 
 def parser() -> argparse.ArgumentParser:
@@ -296,11 +968,30 @@ def parser() -> argparse.ArgumentParser:
                                                 "oldest first.")
     status.set_defaults(handler=cmd_status)
 
-    for name, summary in (("close-run", "push, open the draft pull request, write the run record"),
-                          ("flush", "carry staged rows into the inbox")):
-        later = subcommands.add_parser(name, help=f"{summary} (not in this version)",
-                                       description=f"{summary}. Not in this version.")
-        later.set_defaults(handler=cmd_not_in_this_version)
+    close_run = subcommands.add_parser(
+        "close-run", help="push, open the draft pull request, write the run record",
+        description="End a run as the execution identity: push its branch, open its draft pull "
+                    "request, and stage the run record beside the session stream it references.")
+    close_run.add_argument("--run", required=True, metavar="<ULID>",
+                           help="the run to close")
+    close_run.add_argument("--no-pr", action="store_true",
+                           help="push, but open no pull request")
+    close_run.add_argument("--title", metavar="<title>",
+                           help="the pull request's title; the run's first commit subject by "
+                                "default")
+    close_run.add_argument("--session", metavar="<path>",
+                           help="the session log to read, where the adapter cannot find exactly "
+                                "one")
+    close_run.add_argument("--remove-worktree", action="store_true",
+                           help="give the run's tree back to the clone once it is closed")
+    close_run.set_defaults(handler=cmd_close_run)
+
+    flush = subcommands.add_parser(
+        "flush", help="carry staged rows into the inbox",
+        description="Carry the streams and rows staged by `close-run` into their repositories, "
+                    "under the person's own identity. The validator runs first; a red one commits "
+                    "nothing.")
+    flush.set_defaults(handler=cmd_flush)
 
     return root
 
@@ -313,7 +1004,7 @@ def main(argv=None) -> int:
         print(f"exeris-agent: {exc}", file=sys.stderr)
         return EXIT_REFUSED
     except (config.ConfigError, token.TokenError, runstate.StateError,
-            worktree.WorktreeError) as exc:
+            worktree.WorktreeError, CommandError) as exc:
         print(f"exeris-agent: {exc}", file=sys.stderr)
         return EXIT_FAILED
 

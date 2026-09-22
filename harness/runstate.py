@@ -224,6 +224,29 @@ UNSET = (
 )
 
 
+#: Every variable a shell bound to a run carries: the names `env_values` exports, and
+#: `GITHUB_TOKEN` beside them because the env file unsets it and one inherited from outside reaches
+#: a subprocess the same way. A command that acts as the person drops all of them before it runs
+#: anything — the terminal a run was worked in is the normal place the next command is typed, and a
+#: run's token or a run's `GIT_AUTHOR_NAME` left in it would sign the person's own work as the
+#: identity.
+RUN_ENV_KEYS = (
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_NOSYSTEM",
+    "GH_CONFIG_DIR",
+    "GH_TOKEN",
+    "GIT_SSH_COMMAND",
+    "GIT_TERMINAL_PROMPT",
+    "GIT_ASKPASS",
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "EXERIS_RUN",
+    "GITHUB_TOKEN",
+)
+
+
 def env_values(run_dir: str, *, run_id: str, token: str, user_name: str,
                user_email: str) -> dict[str, str]:
     """The environment a run is bound by, as a mapping — the same values the env file exports.

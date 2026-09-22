@@ -17,14 +17,20 @@ adds::
     bot_login       = "exeris-agent[bot]"
     owner_login     = "…"        # the organisation member accountable for what a run produces
     org             = "exeris-systems"
-    execution_repo  = "…/…"      # where run records land
-    streams_repo    = "…/…"      # where session streams land
+    execution_repo  = "…"        # the local clone rows are carried into
+    streams_repo    = "…"        # the local clone session streams are carried into
 
     [repos.<name>]
     path                = "…"    # the local clone, when it is not beside this checkout
     domain              = "…"    # the oracle domain of the work done there
     scope               = […]    # the vocabulary `--scope` is checked against
     provider_credential = "…"    # the credential class runs there are billed under
+    routine             = "…"    # the routine file a run there follows, hashed into the record
+
+`execution_repo` and `streams_repo` are **paths to local clones**, not repository slugs: a flush
+copies files into them, commits and pushes under the person's own identity, and the repository each
+one is a clone of is read from its own origin. A relative path is read beside the configuration
+file, as a key path is.
 
 Scalars are read from `[github]` first and from the document root second, so a file that grew the
 added fields at the top level is understood the same way as one that put them beside the App's own.
@@ -58,6 +64,7 @@ class Repo:
     domain: str | None = None
     scope: tuple[str, ...] = ()
     provider_credential: object = None
+    routine: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -95,6 +102,16 @@ class Config:
     def key_path(self) -> str:
         """The private key, absolute."""
         return self._beside(self.private_key)
+
+    @property
+    def execution_repo_path(self) -> str | None:
+        """The clone run records are carried into, absolute."""
+        return self._beside(self.execution_repo) if self.execution_repo else None
+
+    @property
+    def streams_repo_path(self) -> str | None:
+        """The clone session streams are carried into, absolute."""
+        return self._beside(self.streams_repo) if self.streams_repo else None
 
     @property
     def age_identity_path(self) -> str | None:
@@ -156,7 +173,8 @@ def load(path: str | None = None) -> Config:
                            path=table.get("path"),
                            domain=table.get("domain"),
                            scope=tuple(scope),
-                           provider_credential=table.get("provider_credential"))
+                           provider_credential=table.get("provider_credential"),
+                           routine=table.get("routine"))
 
     try:
         return Config(

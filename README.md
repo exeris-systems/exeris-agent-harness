@@ -9,7 +9,7 @@ The harness separates them by giving the third kind its own principal — the or
 execution identity, a GitHub App — and by binding that identity to a worktree rather than to a
 shell, so that the boundary holds when the agent opens a second terminal.
 
-**V0 is one command that opens a run.** A run is:
+**V0 is three commands: one opens a run, one closes it, one carries what it produced.** A run is:
 
 - a **worktree** on a branch of its own, cut from `origin/<default>`: the attribution boundary.
   Anything committed inside it is the run's, including a line a person types there — that is
@@ -31,6 +31,10 @@ shell, so that the boundary holds when the agent opens a second terminal.
   joined to the record that observed it.
 - a **manifest** saying what the run is — task, repository, provider, branch, base commit, the
   accountable owner, and the principal that will act.
+- a **record**, written when the run closes: one row in the shape of the layer's row contract,
+  saying what the run was, what it did and under what conditions — and never what it produced. A
+  value the run could not establish is not defaulted; where one is missing there is no row, and the
+  reason is named and counted rather than repaired.
 
 The identity's ceiling is its App permissions and the organisation's rulesets;
 [`policy/README.md`](policy/README.md) is the map to both.
@@ -38,15 +42,37 @@ The identity's ceiling is its App permissions and the organisation's rulesets;
 ## The three commands
 
 ```sh
-bin/exeris-agent open-run --repo exeris-systems/exeris-docs --task reg:<id> --provider claude
+bin/exeris-agent open-run --repo exeris-systems/exeris-docs --task reg:<id> --provider claude \
+                          --scope <scope>
 source ~/.local/state/exeris-agent/runs/<ULID>/env
 cd     ~/.local/state/exeris-agent/runs/<ULID>/wt
+#   … the agent works in that tree …
+bin/exeris-agent close-run --run <ULID>
+bin/exeris-agent flush
 ```
 
-`open-run` prints the second and third; `--launch` runs the provider's adapter in the worktree
-instead of printing them. `--task adhoc` opens an unplanned run, which is capturable but never
-paired, so `--group` requires a registry entry. `exeris-agent status` lists the runs on the
-machine. `close-run` and `flush` are registered and refuse: they are the next version.
+`open-run` prints the second and third lines; `--launch` runs the provider's adapter in the
+worktree instead of printing them. `--task adhoc` opens an unplanned run, which is capturable but
+never paired, so `--group` requires a registry entry. `exeris-agent status` lists the runs on the
+machine.
+
+`close-run` acts **as the identity**: it pushes the run's branch with the token the run minted,
+opens a draft pull request carrying one `Owner:` line and the run's id, and stages a record beside
+a copy of the session log it references. A draft, because a human marking it ready is the moment a
+person takes on what the run produced. It closes the run either way: where the record cannot be
+assembled — two models on the main chain, a client version that moved under the session, a checkout
+with no bundle pin, a client version no fence is registered for — the push and the pull request
+stand and the reason is printed.
+
+`flush` acts **as the person**: their own `gh`, their own git. It carries the session streams into
+the streams repository, resolves each staged row's reference to the commit that now holds its
+stream, runs the inbox's own validator over the batch, and opens one pull request against the
+inbox. A red validator commits nothing and asks for nothing — a defect is fixed at the producer,
+not quarantined in the dataset. The human who opens that pull request is signing off on the batch;
+they are not lending a credential to the runs it describes, and a shell still bound to a run is
+refused rather than used. Rows whose visibility is not the one the target inbox declares in its own
+`inbox.json` stay in staging and are counted: an enterprise-private row's inbox is the enterprise
+sibling, which does not exist yet.
 
 ## Configuration
 
@@ -67,17 +93,25 @@ owner_login     = "…"     # the organisation member accountable for what a run
                           # becomes needs exactly one `Owner:` line, and this is where it
                           # comes from
 org             = "exeris-systems"
-execution_repo  = "…/…"
-streams_repo    = "…/…"
+execution_repo  = "…"     # the local clone rows are carried into
+streams_repo    = "…"     # the local clone session streams are carried into; a flush commits
+                          # and pushes from both, under the person's own identity
 
 [repos.exeris-docs]             # the bare name; `[repos."exeris-systems/exeris-docs"]` names the
                                 # same repository, so a vocabulary configured either way is
                                 # enforced either way
 path                = "…"      # the clone, when it is not beside this checkout
-domain              = "…"
+domain              = "…"      # which oracle judges work done here, spelled as the contract
+                               # spells it: `docs-sweep` or `construction`
 scope               = ["…"]    # the vocabulary --scope is checked against
-provider_credential = "…"
+provider_credential = "…"      # `api`, `subscription` or `local` — the ledger a run belongs in
+routine             = "…"      # the routine a run here follows, hashed into the record with the
+                               # prompt and the agent file; omitted where there is none
 ```
+
+A run against a repository the configuration says nothing about opens and closes, and yields no
+row: the domain, the scope vocabulary and the credential class are what the record's own fields are
+filled from, and a producer that guessed at one would be writing a column nobody could read.
 
 ## What is deliberately not here
 
@@ -95,8 +129,14 @@ Absent on purpose:
   enforcing it from here would put the rule in two places.
 - **containers** — the isolation V0 ships is environment plus tripwire, stated as such in
   `policy/README.md`, with the measurement that decides whether something stronger is owed.
-- **stream redaction** — what a captured session may contain is an open question, and capture that
-  outran the answer would be the wrong thing to have to undo.
+- **stream redaction** — a session log is carried whole into the streams repository and nothing in
+  it is filtered. What such a log may contain is an open question in the records this layer rests
+  on; until it is answered, the stream is treated as content throughout — it never enters an inbox,
+  and the row carries its location, its digest and its event count rather than any of it.
+- **`tool_surface`** — the digest of what a run was permitted to do. Two rows are comparable only
+  where the runner's powers are recorded, so the field is owed; until the harness reads those
+  permissions it is left absent rather than filled, because an absent digest means the powers are
+  unrecorded and a digest over something else would mean nothing at all.
 - **price lists** — a run record carries what was spent in tokens and turns, never a currency
   figure derived from a table that changes under it.
 - **`scope_denials`** — a count of what an agent was stopped from doing. The counter is only
