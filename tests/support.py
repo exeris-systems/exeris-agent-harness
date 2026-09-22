@@ -305,6 +305,16 @@ class HarnessFixture(unittest.TestCase):
             'adapter = "antigravity"\n'
         )
 
+    def configure_domain(self, domain):
+        """The domain the configuration declares for the repository runs are opened against.
+
+        It decides which oracle judges the work, so a case about an oracle sets it here rather than
+        calling the seam directly: the path from a configured domain to a judged row is the part
+        that can break.
+        """
+        self.config_path.write_text(self.config_path.read_text().replace(
+            f'domain = "{DOMAIN}"', f'domain = "{domain}"'))
+
     # ---- the harness under test --------------------------------------------------
 
     def cli(self, argv):

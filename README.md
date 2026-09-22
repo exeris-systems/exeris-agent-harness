@@ -79,7 +79,9 @@ person's, authored as themselves. What the harness binds is a hooks path carryin
 each commit to `<run>/timing.log`, which is evidence beside the run and enters no record.
 
 `baseline --close` writes `{wall_time_ms, outcome, changes}` — the shape the row contract names for
-`human_baseline` — into `<run>/staging/baseline.json` and prints it. The task registry is another
+`human_baseline` — into `<run>/staging/baseline.json` and prints it. The outcome comes from the
+same oracle a model arm's does, over the person's own tree, under the same calibration: two arms
+judged by two instruments compare the instruments. The task registry is another
 repository's, so the group's record is updated by the person: what is printed is what they paste.
 A model arm of the same group opened on this machine reads the staged measurement directly, and one
 opened elsewhere is given the group's record with `--group-file <path>`.
@@ -127,9 +129,18 @@ owner_login     = "…"     # the organisation member accountable for what a run
                           # becomes needs exactly one `Owner:` line, and this is where it
                           # comes from
 org             = "exeris-systems"
-execution_repo  = "…"     # the local clone rows are carried into
+execution_repo  = "…"     # the local clone rows are carried into, and the clone the oracle is
+                          # imported from — the harness keeps no copy of it
 streams_repo    = "…"     # the local clone session streams are carried into; a flush commits
                           # and pushes from both, under the person's own identity
+
+[oracle]
+docs_index      = "…"      # the central ADR registry a documentation checkout is judged against,
+                           # in the clone that publishes it. A checkout that is itself the
+                           # registry is checked against itself and never needs this; without it
+                           # anywhere else that gate does not run, because the alternative is a
+                           # gate that fetches over the network, and a gate that reports the
+                           # network is not a gate
 
 [repos.exeris-docs]         # the bare name; `[repos."exeris-systems/exeris-docs"]` names the
                             # same repository, so a vocabulary configured either way is enforced
@@ -145,6 +156,33 @@ routine         = "…"      # the routine a run here follows, hashed into the r
 A run against a repository the configuration says nothing about opens and closes, and yields no
 row: the domain and the scope vocabulary are what the record's own fields are filled from, and a
 producer that guessed at one would be writing a column nobody could read.
+
+### How a run is judged
+
+`harness/oracle.py` is the seam every outcome this harness writes comes through — a run record's
+and a human baseline's alike, because they are the same question asked about the same work.
+
+A `docs-sweep` run is judged by the oracle `execution_repo` publishes, **imported from that clone
+and never copied here**: a copy is a second implementation of the gates, free to drift from the one
+the calibration suite was run against, and a row's `oracle.version` would then name rules that
+never judged it. The tree it is asked about is the run's own worktree at the head the run left,
+read before anything is pushed, so that what was judged is what the run produced.
+
+Whether that judgement is admissible is not this harness's to decide. It is read, at the moment the
+row is written, from the file the oracle's own mutation suite publishes — `status` and `result` as
+they stood. While that suite has not passed, the row is `UNKNOWN` whatever the gates found
+(ADR-086 §E.19), and the calibration beside it says which pass it is waiting for. Nothing is
+remembered between runs: a row is interpretable only against the calibration in force when it was
+written.
+
+The gates themselves stay with the run, as `staging/judgement.json`. They are not columns on the
+row — a per-gate column is a column about one oracle's internals, not comparable across oracles and
+renamed whenever a gate is — and the file carries both what the oracle concluded and what the row
+was allowed to say, because that pair is what explains a run whose gates all passed and whose row
+reads `UNKNOWN`.
+
+A `construction` run is still `UNKNOWN` at `not-run`. That suite has not been run as a suite, and
+an oracle whose pass has never been contradicted by a known-broken input is unvalidated.
 
 ### The arms
 
@@ -248,11 +286,10 @@ Absent on purpose:
   The methods are designed; freezing them before a second client exists would freeze a guess.
 - **the provenance record** — who acted on GitHub. It joins to a run record by run id, and there
   are no run records yet.
-- **an oracle that judges** — `harness/oracle.py` is the seam every outcome the harness writes
-  comes through, and it answers `UNKNOWN` for every domain with the suite behind it `not-run`. That
-  is not a stub to be tidied away: no suite has been run as a suite, an oracle whose pass has never
-  been contradicted by a known-broken input is unvalidated, and a judge that returned a pass before
-  its suite did would write the label the rule exists to refuse.
+- **an oracle of this repository's own** — the one that judges a documentation run is imported from
+  the execution repository, which is where it is published and calibrated. A copy here would be a
+  second implementation of the gates, free to drift from the one the suite was run against; the
+  construction oracle is absent for the older reason, that its suite has not been run as a suite.
 - **hook changes** — the run id is exported and nothing reads it. The L0 dispatcher is the layer
   the checkout already renders; the harness does not reach into it.
 - **review-policy enforcement** — the policy file is a record of what independent approval means;

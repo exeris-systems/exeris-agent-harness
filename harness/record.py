@@ -149,9 +149,12 @@ def bundle_version(manifest: str | None, source: str = BUNDLE_MANIFEST) -> str:
 
     The text is read at the commit the run started from and passed in, for the reason the agent
     file is: a run that edited the manifest was subject to what it found, and a pin taken from the
-    tree afterwards would record what the run wrote. `oracle.version` is derived from this value on
-    a documentation row, so a manifest read late would name the rules the run wrote as the rules it
-    was judged by.
+    tree afterwards would record what the run wrote.
+
+    This is `repository_state.bundle_version` and nothing else. `oracle.version` on a documentation
+    row is the pin the oracle read out of the tree it actually ran its gates over, which is the
+    same value in every run that did not edit the manifest and is deliberately not this one in a
+    run that did: one field says what the work was subject to, the other says what judged it.
 
     Read with a line scanner rather than a parser because the harness carries no dependencies, and
     the two lines that matter — the bundle an import names and the version it pins — are a fixed
@@ -224,23 +227,29 @@ def system_prompt_sha256(prompt_digest: str, routine: str, agents_file: str) -> 
 def oracle(domain: str, bundle: str, judgement: dict) -> dict:
     """Which oracle judged the run, at what version, in what calibration state.
 
-    The id and the version are the register's; the calibration is the judgement's own, because the
-    state of a suite is something the judge knows and the record does not. Naming a suite that has
-    not run is how a row says which pass it is waiting for, and the result repeats the status
-    because the field holds a score as it was published and no score was.
+    The id is the register's; the version and the calibration are the judgement's own, because
+    which rules were applied and what state the suite behind them was in are things the judge knows
+    and the record does not. Naming a suite that has not run is how a row says which pass it is
+    waiting for, and the result repeats the status because the field holds a score as it was
+    published and no score was.
+
+    The pin the checkout carries is the fallback where the judge named no version — an oracle that
+    did not run named none, and on such a row the version says which rules would have applied.
     """
     if not domain:
         raise NoRow("domain-absent", "the configuration declares no domain for this repository")
     if domain not in ORACLES:
         raise NoRow("oracle-unmappable", domain)
     oracle_id, registered = ORACLES[domain]
-    calibration = dict((judgement or {}).get("calibration") or {})
+    judged = judgement or {}
+    calibration = dict(judged.get("calibration") or {})
     # The suite is the register's wherever the judge named none: a calibration without a suite
     # names a state no reader can look up, which is the same defect as an unpublished oracle id.
     calibration["suite"] = calibration.get("suite") or registered
     return {
         "id": oracle_id,
-        "version": bundle if oracle_id == "docs-guardrails" else SCB_VERSION,
+        "version": (judged.get("version")
+                    or (bundle if oracle_id == "docs-guardrails" else SCB_VERSION)),
         "calibration": calibration,
     }
 

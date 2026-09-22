@@ -20,6 +20,10 @@ adds::
     execution_repo  = "…"        # the local clone rows are carried into
     streams_repo    = "…"        # the local clone session streams are carried into
 
+    [oracle]
+    docs_index      = "…"        # the central ADR registry a documentation checkout is judged
+                                 # against, in the clone that publishes it
+
     [repos.<name>]
     path            = "…"        # the local clone, when it is not beside this checkout
     domain          = "…"        # the oracle domain of the work done there
@@ -38,6 +42,12 @@ repository would have reported both under whichever was configured there.
 copies files into them, commits and pushes under the person's own identity, and the repository each
 one is a clone of is read from its own origin. A relative path is read beside the configuration
 file, as a key path is.
+
+`execution_repo` is also where the documentation oracle is imported from, which is why the harness
+carries no copy of it. `[oracle] docs_index` is the other half: a checkout that is not itself the
+registry is judged against the central one, and the path says which clone publishes it. Without it
+that gate does not run — an unnamed registry would otherwise have to be fetched, and a gate that
+reports the network is not a gate.
 
 Scalars are read from `[github]` first and from the document root second, so a file that grew the
 added fields at the top level is understood the same way as one that put them beside the App's own.
@@ -86,6 +96,11 @@ class Config:
     org: str = DEFAULT_ORG
     execution_repo: str | None = None
     streams_repo: str | None = None
+    #: The central ADR registry the documentation oracle checks a checkout against, where the
+    #: configuration names one. It is a path into the clone that publishes it rather than a copy,
+    #: for the reason the oracle itself is imported and not copied: a second registry on disk is a
+    #: second answer to what is registered.
+    docs_index: str | None = None
     repos: dict[str, Repo] = dataclasses.field(default_factory=dict)
     #: The `[providers.<name>]` tables as the file wrote them. They are carried rather than
     #: interpreted: what an arm may declare is `providers`' own, and a second opinion here would
@@ -122,6 +137,11 @@ class Config:
     def streams_repo_path(self) -> str | None:
         """The clone session streams are carried into, absolute."""
         return self.beside(self.streams_repo) if self.streams_repo else None
+
+    @property
+    def docs_index_path(self) -> str | None:
+        """The central ADR registry, absolute, or nothing where none is configured."""
+        return self.beside(self.docs_index) if self.docs_index else None
 
     @property
     def age_identity_path(self) -> str | None:
@@ -185,6 +205,10 @@ def load(path: str | None = None) -> Config:
                            scope=tuple(scope),
                            routine=table.get("routine"))
 
+    oracle_table = document.get("oracle") or {}
+    if not isinstance(oracle_table, dict):
+        raise ConfigError(f"{resolved}: [oracle] is not a table")
+
     providers = {}
     for name, table in (document.get("providers") or {}).items():
         if not isinstance(table, dict):
@@ -204,6 +228,7 @@ def load(path: str | None = None) -> Config:
             org=str(_scalar(document, github, "org", DEFAULT_ORG)),
             execution_repo=_scalar(document, github, "execution_repo"),
             streams_repo=_scalar(document, github, "streams_repo"),
+            docs_index=oracle_table.get("docs_index"),
             repos=repos,
             providers=providers,
         )

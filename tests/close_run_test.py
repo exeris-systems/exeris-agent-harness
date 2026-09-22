@@ -67,11 +67,6 @@ class CloseRunTest(support.HarnessFixture):
         self.git("add", "-A", cwd=self.execution)
         self.git("commit", "-m", "chore: the contract version this case reads", cwd=self.execution)
 
-    def _configured_domain(self, domain):
-        """The domain the configuration declares for the repository runs are opened against."""
-        self.config_path.write_text(self.config_path.read_text().replace(
-            f'domain = "{support.DOMAIN}"', f'domain = "{domain}"'))
-
     def _closed_run(self, *extra, model=None, version=None):
         self.open_run()
         self.head = self.commit()
@@ -173,7 +168,7 @@ class CloseRunTest(support.HarnessFixture):
         # Which oracle judged a run is looked up by the domain the configuration declares, in the
         # contract's own spelling. `docs-guardrails` is versioned by the bundle in force, which is
         # the rules the run was subject to — the same value the row carries for the checkout.
-        self._configured_domain(support.DOCUMENTATION_DOMAIN)
+        self.configure_domain(support.DOCUMENTATION_DOMAIN)
         self._closed_run()
         row = self.staged_row()
 
@@ -295,7 +290,7 @@ class CloseRunTest(support.HarnessFixture):
     def test_a_domain_no_oracle_is_published_for_yields_no_row(self):
         # `docs` is a domain no reader can look an oracle up for. A producer that translated it to
         # the contract's spelling would be deciding what the row was judged by.
-        self._configured_domain("docs")
+        self.configure_domain("docs")
         noticed = io.StringIO()
         with contextlib.redirect_stderr(noticed):
             self._closed_run()

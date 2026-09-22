@@ -432,6 +432,34 @@ AGENTS_FILE = "AGENTS.md"
 #: second time or ask for a second pull request.
 CLOSED = "closed.json"
 
+#: What the oracle found, gate by gate, staged with the run and carried into no inbox. The row says
+#: which oracle judged the run and what it concluded; the gates behind that are this oracle's own
+#: internals, and a run whose row reads `UNKNOWN` over passing gates is explained here rather than
+#: in a column nobody could compare across oracles.
+JUDGEMENT_FILE = "judgement.json"
+
+
+def _judged(cfg, worktree_path: str, domain: str, run_id: str) -> dict:
+    """Ask the seam, and say beside the run what it could not read.
+
+    The judge is given paths and never the configuration, so that what an oracle is shown is
+    visible at the call. Anything it could not read is printed rather than swallowed: `UNKNOWN`
+    because no oracle was there and `UNKNOWN` because the gates found nothing to judge are the
+    same word on the row, and the difference is a person's to act on.
+    """
+    judgement = oracle.judge(worktree_path, domain or "",
+                             execution_repo=cfg.execution_repo_path,
+                             index=cfg.docs_index_path)
+    if judgement.get("reason"):
+        print(f"exeris-agent: {run_id}: {judgement['reason']}", file=sys.stderr)
+    return judgement
+
+
+def _stage_judgement(run_dir: str, judgement: dict, *, run_id: str, domain: str) -> None:
+    body = json.dumps(oracle.evidence(judgement, run_id=run_id, domain=domain or ""),
+                      indent=2, sort_keys=True) + "\n"
+    runstate.write_text(run_dir, os.path.join("staging", JUDGEMENT_FILE), body)
+
 
 def _run_environment(run_dir: str, manifest: dict, cfg) -> dict:
     """The environment the run's own calls are made in — the one `open-run` printed.
@@ -511,7 +539,7 @@ def _title(net, worktree_path: str, commits: list, run_id: str) -> str:
 
 
 def _row(args, cfg, net, manifest, *, worktree_path, visibility, dirty, commits,
-         ended_at) -> tuple[dict | None, str | None, str | None]:
+         ended_at, judgement) -> tuple[dict | None, str | None, str | None]:
     """`(row, session path, reason)` — the run record, or why there is not one.
 
     Every refusal reaches here as `NoRow` and leaves as a reason, because a run that cannot be
@@ -580,10 +608,11 @@ def _row(args, cfg, net, manifest, *, worktree_path, visibility, dirty, commits,
             prompt_digest=manifest.get("prompt_sha256") or facts.get("system_prompt_sha256") or "",
             routine=routine,
             agents_file=agents_file,
-            # Asked once, of the seam that owns the question. A judgement and the state of the
-            # suite behind it travel together, so that a label is never read apart from what makes
-            # it admissible.
-            judgement=oracle.judge(worktree_path, repo_config.domain or ""),
+            # Asked once, of the seam that owns the question, and asked before the branch was
+            # pushed so that what was judged is what the run produced. A judgement and the state
+            # of the suite behind it travel together, so that a label is never read apart from
+            # what makes it admissible.
+            judgement=judgement,
         )
         return row, session, None
     except capture.NoRow as refusal:
@@ -638,6 +667,13 @@ def cmd_close_run(args) -> int:
         print(f"exeris-agent: {len(unattributed)} unattributed-commit on {branch} — no "
               f"`{trailer}` trailer: {', '.join(sha[:8] for sha in unattributed)}", file=sys.stderr)
 
+    # Judged at the head the run left, before anything of it has gone anywhere. The oracle reads a
+    # tree, so the tree it reads has to be the one the commits above produced: a judgement taken
+    # after a push would still be honest, and one taken after a merge or a rebase would not be, and
+    # the order is what keeps that from ever being a question.
+    domain = cfg.repo(repo.split("/", 1)[1]).domain
+    judgement = _judged(cfg, worktree_path, domain, run_id)
+
     net.git(worktree_path, "push", "origin", f"HEAD:refs/heads/{branch}", env=environment)
 
     pull_request = None
@@ -657,10 +693,13 @@ def cmd_close_run(args) -> int:
     visibility = _visibility(net, repo, environment)
     row, session, reason = _row(args, cfg, net, manifest, worktree_path=worktree_path,
                                 visibility=visibility, dirty=dirty, commits=commits,
-                                ended_at=ended_at)
+                                ended_at=ended_at, judgement=judgement)
 
     date = record.date_of(manifest["started_at"])
     os.makedirs(staging, mode=runstate.DIR_MODE, exist_ok=True)
+    # Staged whether or not there is a row. A run the record could not be assembled for was judged
+    # all the same, and the gates are the one account of it that survives.
+    _stage_judgement(run_dir, judgement, run_id=run_id, domain=domain)
     if row is not None:
         # The stream is copied rather than referenced: the client's own log is the person's and may
         # be rotated or removed, and the row's digest has to keep naming something that exists.
@@ -826,9 +865,12 @@ def _close_baseline(args) -> int:
     ended_at = _now()
     wall_time_ms = max(int((record.stamp(ended_at)
                             - record.stamp(manifest["started_at"])).total_seconds() * 1000), 0)
-    # The same judge the run record's outcome comes from, asked the same way. A baseline judged by
-    # anything else is not a baseline: the comparison it exists for is a comparison of outcomes.
-    judgement = oracle.judge(worktree_path, manifest.get("domain") or "")
+    # The same judge the run record's outcome comes from, asked the same way, over the same kind of
+    # tree. A baseline judged by anything else is not a baseline: the comparison it exists for is a
+    # comparison of outcomes, and two arms measured by two instruments compare the instruments.
+    domain = manifest.get("domain") or ""
+    judgement = _judged(config.load(), worktree_path, domain, args.run)
+    _stage_judgement(run_dir, judgement, run_id=args.run, domain=domain)
     baseline = {"wall_time_ms": wall_time_ms, "outcome": oracle.outcome_of(judgement)}
     changes = _changes(net, worktree_path, manifest["base_sha"])
     if changes is None:
