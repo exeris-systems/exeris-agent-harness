@@ -26,6 +26,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 
 from harness.capture import NoRow
 
@@ -44,7 +45,13 @@ VERSION_FILE = "agy.version"
 #: Every other step type is a tool step. The set of those types is unmeasured — the client names
 #: them as it likes — so they are counted rather than enumerated, and the names actually seen are
 #: printed beside the run so the first real run says what they are.
-CONVERSATION = ("user_input", "agent_response")
+#:
+#: The first of the two is the one name this adapter has to assume, because both counts it takes
+#: are defined against it: a tool step is a step that is not conversation, and steering is prompts
+#: after the first. A stream that never spells it is a stream whose vocabulary is not this one, and
+#: it is refused rather than counted — see `read`.
+PROMPT_STEP = "user_input"
+CONVERSATION = (PROMPT_STEP, "agent_response")
 
 #: A step state that names a refusal. The client's state vocabulary is unmeasured beyond the states
 #: a completed step passes through, so this matches the word rather than a list: where no state in
@@ -224,7 +231,29 @@ def read(path: str) -> dict:
     if turns is None:
         raise NoRow("session-unreadable", f"{path} reports no turn count")
 
-    prompts = sum(1 for kind in steps.values() if kind == "user_input")
+    kinds: dict[str, int] = {}
+    for kind in steps.values():
+        kinds[kind or "<unnamed>"] = kinds.get(kind or "<unnamed>", 0) + 1
+    notes = [
+        "step types: " + ", ".join(f"{name}={count}" for name, count in sorted(kinds.items())),
+        "step states: " + (", ".join(sorted({state for seen in states.values()
+                                             for state in seen})) or "none"),
+    ]
+
+    # The assumption both counts rest on, checked here rather than carried into them. Under a
+    # client that spells its prompt step some other way, every prompt is counted as a tool call and
+    # the steering count reads `0` — a positive claim that nobody steered the run, made out of a
+    # name nobody measured. The names the stream did use go to the person here, because a refusal
+    # takes the notes below out of the harness's hands and they are the whole of what makes this
+    # one answerable: a first run under an unknown client says which vocabulary it speaks.
+    if not any(kind == PROMPT_STEP for kind in steps.values()):
+        for note in notes:
+            print(f"exeris-agent: {path}: {note}", file=sys.stderr)
+        raise NoRow("session-unreadable",
+                    f"{path} names no {PROMPT_STEP} step, so its tool steps cannot be told from "
+                    f"its prompts")
+
+    prompts = sum(1 for kind in steps.values() if kind == PROMPT_STEP)
     tool_calls = sum(1 for kind in steps.values() if kind and kind not in CONVERSATION)
 
     # A step whose state names a refusal, counted. Where no state in the stream names one, the
@@ -236,15 +265,6 @@ def read(path: str) -> dict:
     wall_time_ms = (max(int(round(float(seconds) * 1000)), 0)
                     if isinstance(seconds, (int, float)) and not isinstance(seconds, bool)
                     else None)
-
-    kinds: dict[str, int] = {}
-    for kind in steps.values():
-        kinds[kind or "<unnamed>"] = kinds.get(kind or "<unnamed>", 0) + 1
-    notes = [
-        "step types: " + ", ".join(f"{name}={count}" for name, count in sorted(kinds.items())),
-        "step states: " + (", ".join(sorted({state for seen in states.values()
-                                             for state in seen})) or "none"),
-    ]
 
     return {
         "path": path,
@@ -260,8 +280,11 @@ def read(path: str) -> dict:
         "usage": _usage(result.get("usage")),
         "wall_time_ms": wall_time_ms,
         # The first prompt is what started the run; what is counted here is steering, which is why
-        # a run asked once and left to finish is `0` rather than `1`.
-        "human_prompts": max(prompts - 1, 0) if prompts else 0,
+        # a run asked once and left to finish is `0` rather than `1`. With no prompt in the stream
+        # there is no count to take, and the row carries none: this adapter's rule throughout is
+        # that what the stream does not carry is absent, and a `0` there would be the one shape of
+        # the rule that reads as a measurement.
+        "human_prompts": max(prompts - 1, 0) if prompts else None,
         "permission_denials": denials or None,
         # The stream carries no prompt text. The digest of what instructed the run comes from the
         # file the harness passed the client, which is why this adapter cannot be run without one.

@@ -15,6 +15,9 @@ The cases here are the ones that make that protocol observable rather than remem
   object pasted into the group record and the object every arm of the group then carries.
 * *A model arm of a human-baselined group does not open before the baseline exists.* That is the
   protocol, enforced where it can be: at the moment the arm would have started.
+* *The baseline it carries measured this arm's own task.* A group is one planned task; a
+  measurement of another one, copied identically onto every arm, is agreement the far end cannot
+  tell from a measurement of the work.
 """
 
 import contextlib
@@ -33,6 +36,9 @@ for _path in (str(_HERE.parent), str(_HERE)):
 import support  # noqa: E402  — the fixture, which puts the checkout on the path
 
 GROUP = "G-0001"
+#: A second planned task, for the case that a group is one task and a baseline of another is not
+#: this group's measurement.
+OTHER_TASK = "reg:T-0002"
 
 
 class BaselineTest(support.HarnessFixture):
@@ -169,6 +175,25 @@ class BaselineTest(support.HarnessFixture):
         # comparable with each other and with the human only if all of them carry the same one.
         self.assertEqual(measured, row["human_baseline"])
         self.assertEqual("human", row["pairing"]["baseline"])
+
+    def test_a_baseline_of_this_group_measured_on_another_task_is_refused(self):
+        # This is the path that needs no `--group-file`, so a mismatch here reaches every row of
+        # the group without the person seeing it: the object is byte-identical on each arm, which
+        # is the whole of what the inbox can check about it.
+        self._measured()
+        noticed = io.StringIO()
+        with contextlib.redirect_stderr(noticed):
+            code = self.cli(["open-run", "--repo", str(self.clone), "--provider", "claude",
+                             "--task", OTHER_TASK, "--scope", support.SCOPE, "--group", GROUP,
+                             "--arm", "b", "--arms-planned", "1", "--baseline", "human"])
+        self.assertEqual(2, code, "an arm carried a baseline measured on another task")
+        said = noticed.getvalue()
+        # Both refs, because the person is told which measurement exists and which was wanted —
+        # not that the group has no baseline, which is the reading a silent miss leaves.
+        self.assertIn(support.TASK, said)
+        self.assertIn(OTHER_TASK, said)
+        self.assertEqual([], [path for path in self.state_root.rglob("manifest.json")
+                              if json.loads(path.read_text()).get("kind") != "baseline"])
 
     def test_a_group_record_is_read_where_the_registry_holds_the_baseline(self):
         # The registry is another repository's, so the group's record reaches the harness as a file

@@ -151,25 +151,40 @@ def _baseline_in_file(path: str) -> dict | None:
     return None
 
 
-def _baseline_on_this_machine(group: str) -> dict | None:
+def _baseline_on_this_machine(group: str, task: str) -> dict | None:
     """The human baseline a `baseline` run of this group staged here, where one did.
 
     A producer knows about the arms it ran itself, so a group whose human arm was measured on this
     machine needs no file passed to it. Two baselines that do not agree are refused rather than
     chosen between: every row of a group carries this object identically, and a group with two of
     them is a group nobody can interpret.
+
+    The task is matched as well as the group, because a group is one planned task and a human arm
+    that measured another one measured different work. Nothing downstream can see that: the object
+    is copied onto every arm of the group, so it is identical wherever it is checked, and identical
+    is all the far end can ask about it. A baseline of this group under another task is named in a
+    refusal rather than passed over, because a miss here surfaces as the refusal that says the
+    group has no baseline at all, which sends the person to measure one they already have.
     """
-    found = {}
+    found, elsewhere = {}, {}
     for run_dir in runstate.all_runs():
         manifest = runstate.read_manifest(run_dir) or {}
         if manifest.get("kind") != BASELINE_KIND or manifest.get("group") != group:
             continue
         path = os.path.join(run_dir, "staging", BASELINE_FILE)
+        if manifest.get("task") != task:
+            if os.path.isfile(path):
+                elsewhere[str(manifest.get("task"))] = path
+            continue
         try:
             with open(path, encoding="utf-8") as handle:
                 found[json.dumps(json.load(handle), sort_keys=True)] = path
         except (OSError, json.JSONDecodeError):
             continue
+    if not found and elsewhere:
+        raise Refused(f"group {group} has a human baseline staged on this machine and it measured "
+                      f"{', '.join(sorted(elsewhere))}, not {task}: "
+                      f"{', '.join(sorted(elsewhere.values()))}")
     if not found:
         return None
     if len(found) > 1:
@@ -194,8 +209,12 @@ def _human_baseline(args, pairing: dict) -> dict | None:
     if not pairing or pairing.get("baseline") != "human":
         return None
     required = True if args.baseline_required is None else bool(args.baseline_required)
+    # The ref as a run records it, so that the arm's task and a staged baseline's are compared in
+    # one spelling. A pairing is only ever a `reg:` task, which is the one class this resolves to
+    # the same value for whatever run id it is given.
+    task = _task_ref(args.task, "0" * ulid.LENGTH)
     measured = (_baseline_in_file(args.group_file) if args.group_file
-                else _baseline_on_this_machine(pairing["group_id"]))
+                else _baseline_on_this_machine(pairing["group_id"], task))
     if measured is None and required:
         raise Refused(f"group {pairing['group_id']} is planned with a human arm and no human "
                       f"baseline exists yet: run `exeris-agent baseline --repo … --task "
@@ -597,9 +616,12 @@ def _row(args, cfg, net, manifest, *, worktree_path, visibility, dirty, commits,
             # date: an id no entry carries is a mark nobody can say they are on the far side of.
             # The producer is the harness and the adapter that read the run — never the model, and
             # never the arm's own name: two arms read by one adapter are two rows under one fence,
-            # and what differs between them is on the rows themselves.
+            # and what differs between them is on the rows themselves. The arm's weights are the
+            # exception and are passed: they are instrument state, so rows either side of a change
+            # to them are not one population.
             fence=record.fence(cfg.execution_repo_path or "", adapter,
-                               arm.get("harness_version") or facts["version"]),
+                               arm.get("harness_version") or facts["version"],
+                               arm.get("model_snapshot")),
             ref=record.stream_ref(cfg.org, os.path.basename(cfg.streams_repo_path or ""), date,
                                   manifest["repo"].split("/", 1)[1], manifest["run_id"]),
             # The prompt as it was passed, where the run was given one, and otherwise the prompt

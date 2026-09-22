@@ -20,6 +20,7 @@ harness, so what a case asserts is the request that left the process.
 """
 
 import datetime
+import hashlib
 import json
 import os
 import pathlib
@@ -93,13 +94,21 @@ AGY_CLIENT = "antigravity"
 AGY_VERSION = "1.9.9"
 AGY_FENCE = f"2026-09-19-harness-antigravity-cc-{AGY_VERSION.replace('.', '-')}"
 
+#: The local arm: weights this machine holds, run through the same client as the vendor arm. A
+#: model snapshot is instrument state, so the two differ in nothing the first two segments of an id
+#: carry and the weights digest is what keeps their rows apart.
+LOCAL_WEIGHTS = b"placeholder: a file in the shape weights have, and not a model\n"
+LOCAL_SNAPSHOT = hashlib.sha256(LOCAL_WEIGHTS).hexdigest()
+LOCAL_FENCE = f"{FENCE}-w-{LOCAL_SNAPSHOT[:12]}"
+
 
 def _entry(fence, producer):
     return (f"| `{fence}` | 2026-09-19 | harness, {producer} | placeholder: the producer these "
             f"tests run as, entered so its rows have an id to resolve | placeholder entry |\n")
 
 
-REGISTER_ENTRIES = (_entry(FENCE, "claude"), _entry(AGY_FENCE, "antigravity"))
+REGISTER_ENTRIES = (_entry(FENCE, "claude"), _entry(AGY_FENCE, "antigravity"),
+                    _entry(LOCAL_FENCE, "claude over local weights"))
 
 #: Where the row contract is read from. A checkout that does not have it skips these cases rather
 #: than checking a row against a copy: a second copy of a contract is a second answer.

@@ -17,13 +17,19 @@
 # The version is captured here rather than at close, because the version that ran is the version
 # that was installed when it ran, and a client upgraded between the run and its record would
 # otherwise be reported as the one that did the work.
+#
+# Both streams are captured, because where a CLI prints its version is not a property this adapter
+# gets to assume. Discarding standard error leaves an empty file under a client that prints there,
+# and the adapter then falls back to asking the installed program — which succeeds, silently, and
+# records the wrong version. The reader takes a version out of whatever else the line says and
+# refuses a line too long to be one, so a diagnostic banner costs nothing.
 set -eu
 
 run_dir="$(dirname "${GIT_CONFIG_GLOBAL:?the run environment has not been sourced}")"
 prompt_file="${EXERIS_PROMPT_FILE:?the task reaches this client on its command line}"
 model="${EXERIS_MODEL_ID:?the provider table declares no model_id}"
 
-agy --version > "${run_dir}/agy.version" 2>/dev/null || true
+agy --version > "${run_dir}/agy.version" 2>&1 || true
 
 exec agy --output-format stream-json \
          --model "${model}" \

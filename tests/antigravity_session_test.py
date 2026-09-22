@@ -11,12 +11,17 @@ whether the counts taken from it mean what a column of them would be read to mea
   gate nobody has seen fire as a gate that did not fire, and `capture_level` says which.
 * *The turns are the client's own count, and so is the time.* Both are on the closing event; a
   stream without one is a session this adapter cannot count.
+* *The one name the counts rest on is checked, not assumed.* Both counts are defined against the
+  prompt step's type, so a stream that never names it is refused — counting it as tool work would
+  make a run nobody steered out of a run whose steering nobody could see.
 * *No text leaves the adapter.* The prompt reaches this client on its command line and the stream
   carries none of it, so the digest of what instructed the run comes from the file the harness
   passed and from nowhere else.
 """
 
+import contextlib
 import hashlib
+import io
 import json
 import pathlib
 import shutil
@@ -130,6 +135,20 @@ class AgyStreamTest(unittest.TestCase):
         self.assertNotIn("placeholder answer", json.dumps(facts))
 
     # ---- what the adapter refuses ------------------------------------------------
+
+    def test_a_stream_naming_no_prompt_step_is_refused_rather_than_counted(self):
+        # The client's step-type vocabulary is unmeasured. Under another spelling of the prompt
+        # step, every prompt falls into the tool count and the steering count reads `0` — a row
+        # asserting that nobody steered the run, over a column nothing measured.
+        renamed = json.loads(json.dumps(self.entries).replace('"user_input"', '"user_turn"'))
+        noticed = io.StringIO()
+        with contextlib.redirect_stderr(noticed):
+            with self.assertRaises(NoRow) as refusal:
+                session.read(str(self._stream(renamed)))
+        self.assertEqual("session-unreadable", refusal.exception.reason)
+        self.assertIn(session.PROMPT_STEP, refusal.exception.detail)
+        # What makes the refusal answerable: the names the stream actually used.
+        self.assertIn("user_turn=2", noticed.getvalue())
 
     def test_a_stream_that_never_closed_is_refused(self):
         entries = [entry for entry in self.entries if entry.get("event") != "result"]

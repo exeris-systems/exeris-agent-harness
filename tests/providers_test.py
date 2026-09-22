@@ -151,6 +151,33 @@ class ProvidersTest(support.HarnessFixture):
         self.assertIn("ANTHROPIC_AUTH_TOKEN='placeholder-proxy-token'", env)
         self.assertEqual(0o600, os.stat(self.run_dir() / "env").st_mode & 0o777)
 
+    def test_a_local_arm_s_rows_are_not_under_the_vendor_arm_s_fence(self):
+        # The two arms reach one client at one version and differ in the weights: without the
+        # digest in the id they resolve the same entry, and rows whose model reference differs
+        # would be summarised in one figure — which is what a fence exists to prevent. Swapping
+        # the weights moves the rows again, for the same reason.
+        weights = self._weights(support.LOCAL_WEIGHTS)
+        self.config_path.write_text(self.base_config + (
+            "\n[providers.local-claude]\n"
+            'provider = "local"\n'
+            'credential = "local"\n'
+            'adapter = "claude"\n'
+            'model_id = "placeholder-local-model"\n'
+            f'weights = "{weights}"\n'))
+
+        self.assertEqual(0, self.cli(["open-run", "--repo", str(self.clone),
+                                      "--provider", "local-claude", "--task", support.TASK,
+                                      "--scope", support.SCOPE]))
+        self.commit()
+        self.place_session()
+        self.assertEqual(0, self.cli(["close-run", "--run", self.run_id()]))
+
+        row = self.staged_row()
+        self.assertEqual(f"sha256:{support.LOCAL_SNAPSHOT}", row["agent"]["model_snapshot"])
+        self.assertEqual("local", row["accounting"]["mode"])
+        self.assertEqual(support.LOCAL_FENCE, row["instrument"]["fence"])
+        self.assertNotEqual(support.FENCE, row["instrument"]["fence"])
+
     def test_a_builtin_opens_a_run_with_no_table_of_its_own(self):
         # The three vendor CLIs go on working under their own names. What such a run cannot say is
         # which ledger it was billed to, so it opens and its row is refused rather than guessed at.

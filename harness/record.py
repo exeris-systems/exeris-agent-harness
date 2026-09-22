@@ -42,6 +42,12 @@ _NOT_SEGMENT = re.compile(r"[^a-z0-9]+")
 #: an id.
 _FENCE_ID = re.compile(r"`(\d{4}-\d{2}-\d{2}(?:-[a-z0-9]+)+)`")
 
+#: `agent.model_snapshot` where the weights are this machine's, and how much of the digest the
+#: register's grammar puts in an id. The pattern is exact: a snapshot of a shape the grammar has no
+#: segment for is refused rather than written under the segment of a different shape.
+_SNAPSHOT = re.compile(r"^sha256:([0-9a-f]{64})$")
+_WEIGHTS_SEGMENT = 12
+
 #: The register a fence id resolves in, inside the contract repository.
 FENCES = os.path.join("docs", "fences.md")
 
@@ -105,7 +111,8 @@ def segment(value: str) -> str:
     return _NOT_SEGMENT.sub("-", str(value).lower()).strip("-")
 
 
-def fence(execution_repo: str, provider: str, client_version: str) -> str:
+def fence(execution_repo: str, provider: str, client_version: str,
+          model_snapshot: str | None = None) -> str:
     """The registered fence a harness row is written under, read from the register.
 
     The id names the producer and the client version, because both are part of what a row means: a
@@ -118,8 +125,22 @@ def fence(execution_repo: str, provider: str, client_version: str) -> str:
     entry ends in this producer's suffix; where the register carries none, or carries more than
     one, there is no id this row can assert and no row is written. A new client version is
     registered before its first row, which is the whole of what the register is for.
+
+    A row whose weights are this machine's names them in the suffix too, because a model snapshot
+    is one of the changes §E.20 writes a fence for. Under one adapter at one client version, an arm
+    reaching a vendor and an arm loading weights here differ in nothing else the id carries — and a
+    second set of weights under that arm differs in nothing at all — so without the digest they
+    resolve to one entry and rows whose model reference differs sit on one fence. A row whose
+    snapshot is unresolved names no weights and keeps the shorter form: there is nothing to name.
     """
     suffix = f"-harness-{segment(provider)}-cc-{segment(client_version)}"
+    if model_snapshot and str(model_snapshot).startswith("sha256:"):
+        digested = _SNAPSHOT.match(str(model_snapshot))
+        if not digested:
+            raise NoRow("fence-unregistered",
+                        f"the register's grammar has no segment for a model snapshot of the shape "
+                        f"{model_snapshot!r}")
+        suffix += f"-w-{digested.group(1)[:_WEIGHTS_SEGMENT]}"
     path = os.path.join(execution_repo, FENCES)
     try:
         with open(path, encoding="utf-8") as handle:

@@ -97,8 +97,9 @@ opens a draft pull request carrying one `Owner:` line and the run's id, and stag
 a copy of the session log it references. A draft, because a human marking it ready is the moment a
 person takes on what the run produced. It closes the run either way: where the record cannot be
 assembled — two models on the main chain, a client version that moved under the session, a checkout
-with no bundle pin, a client version no fence is registered for, a group whose human arm was never
-measured — the push and the pull request stand and the reason is printed.
+with no bundle pin, a client version (or, on a local arm, a set of weights) no fence is registered
+for, a group whose human arm was never measured — the push and the pull request stand and the
+reason is printed.
 
 `flush` acts **as the person**: their own `gh`, their own git. It carries the session streams into
 the streams repository, resolves each staged row's reference to the commit that now holds its
@@ -273,7 +274,12 @@ everything it does not carry is absent from the row rather than zero:
 | `agent.system_prompt_sha256` | the `--prompt-file` the harness passed, composed as for every other arm |
 
 The tool step types are unmeasured: the client names them as it likes, so they are counted rather
-than enumerated, and the distinct types and states a run used are printed when it closes. The
+than enumerated, and the distinct types and states a run used are printed when it closes. The one
+name the two counts rest on is `user_input` — a tool step is a step that is not conversation, and
+steering is the prompts after the first — so a stream that never spells it is refused rather than
+counted, and the types it did use are printed beside the refusal. That is how a client whose
+vocabulary differs is discovered: by a run that leaves no row and says what it saw, never by a
+column of tool calls with the prompts folded into it. The
 client's thinking-token count and its total are deliberately not carried — neither is one of the
 four counts the contract names, and the second is a sum a reader can take.
 
