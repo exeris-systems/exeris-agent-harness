@@ -88,12 +88,12 @@ class ProvidersTest(support.HarnessFixture):
     def test_a_launch_value_is_read_from_the_file_it_names(self):
         # A value that has to be a secret is a path, and the file is read when the run opens. A
         # configuration file that says it holds no secret has to go on being true.
-        secret = self.tmp / "proxy-token"
-        secret.write_text("placeholder-proxy-token\n")
+        read_at_open = self.tmp / "proxy-token"
+        read_at_open.write_text("placeholder-proxy-token\n")
         cfg = self._config('provider = "local"\ncredential = "local"\nadapter = "claude"\n'
                            '[providers.local-arm.env]\n'
                            'ANTHROPIC_BASE_URL = "http://127.0.0.1:8080"\n'
-                           f'ANTHROPIC_AUTH_TOKEN = "file:{secret}"\n')
+                           f'ANTHROPIC_AUTH_TOKEN = "file:{read_at_open}"\n')
         arm = providers.resolve(cfg, "local-arm")
         self.assertEqual("placeholder-proxy-token", arm.env["ANTHROPIC_AUTH_TOKEN"])
         self.assertEqual("http://127.0.0.1:8080", arm.env["ANTHROPIC_BASE_URL"])
@@ -117,8 +117,8 @@ class ProvidersTest(support.HarnessFixture):
     # ---- what the run records of it ----------------------------------------------
 
     def test_the_manifest_records_the_arm_and_the_names_of_its_variables_only(self):
-        secret = self.tmp / "proxy-token"
-        secret.write_text("placeholder-proxy-token\n")
+        read_at_open = self.tmp / "proxy-token"
+        read_at_open.write_text("placeholder-proxy-token\n")
         weights = self._weights()
         self.config_path.write_text(self.base_config + (
             "\n[providers.local-claude]\n"
@@ -129,7 +129,7 @@ class ProvidersTest(support.HarnessFixture):
             f'weights = "{weights}"\n'
             "[providers.local-claude.env]\n"
             'ANTHROPIC_BASE_URL = "http://127.0.0.1:8080"\n'
-            f'ANTHROPIC_AUTH_TOKEN = "file:{secret}"\n'))
+            f'ANTHROPIC_AUTH_TOKEN = "file:{read_at_open}"\n'))
 
         self.assertEqual(0, self.cli(["open-run", "--repo", str(self.clone),
                                       "--provider", "local-claude", "--task", support.TASK,

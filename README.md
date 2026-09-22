@@ -228,7 +228,7 @@ a credential, and the record of a run is not where a credential is kept.
 ### The three arms this machine runs
 
 | Arm | `[providers.…]` | What the row says |
-|:--|:--|:--|
+| :-- | :-- | :-- |
 | a vendor CLI | `claude` (or `codex`, `gemini`) with a `credential` | the vendor, the model the session log names, `unresolved:<model_id>` |
 | Antigravity | `adapter = "antigravity"`, a `model_id`, a `credential` | the vendor, the model the stream names, `unresolved:<model_id>` |
 | a local model | `adapter = "claude"`, `credential = "local"`, `weights`, and an `env` pointing the client at a local endpoint | `provider = "local"`, `accounting.mode: local`, `model_snapshot: sha256:<weights>` |
@@ -261,7 +261,7 @@ both the session log and the stream the row references. Every count below comes 
 everything it does not carry is absent from the row rather than zero:
 
 | Row field | From |
-|:--|:--|
+| :-- | :-- |
 | `agent.model_id` | the `init` event's model |
 | `agent.harness` | `antigravity`, at the version the launcher recorded when the run started |
 | `execution.turns` | the closing event's own turn count |

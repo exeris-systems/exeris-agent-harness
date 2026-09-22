@@ -418,10 +418,10 @@ class OpenRunTest(unittest.TestCase):
 
     def test_the_credential_helper_answers_only_for_the_organisation(self):
         self._open_run("--task", "adhoc")
-        secret = f"password={FAKE_TOKEN}"
+        expected_answer = f"password={FAKE_TOKEN}"
 
         served = self._credential("github.com", f"{ORG}/exeris-agent-harness.git")
-        self.assertIn(secret, served.stdout, "the helper does not serve the organisation")
+        self.assertIn(expected_answer, served.stdout, "the helper does not serve the organisation")
 
         for host, path in (
             ("github.com", "someone-else/their-repo.git"),
