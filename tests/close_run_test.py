@@ -94,7 +94,9 @@ class CloseRunTest(support.HarnessFixture):
         # The runtime exposes no dated snapshot for the model that took the turns, so the row
         # carries the alias marked. The bare alias would claim a precision no row has.
         agent = row["agent"]
-        self.assertEqual("claude", agent["provider"])
+        # The vendor whose model took the turns, from the provider table — never the name of the
+        # client that ran it, which `agent.harness` carries a field below.
+        self.assertEqual(support.PROVIDER, agent["provider"])
         self.assertEqual("claude-sonnet-5", agent["model_id"])
         self.assertEqual("unresolved:claude-sonnet-5", agent["model_snapshot"])
         self.assertEqual({"client": "claude-code", "version": "2.1.278"}, agent["harness"])

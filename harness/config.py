@@ -21,11 +21,18 @@ adds::
     streams_repo    = "…"        # the local clone session streams are carried into
 
     [repos.<name>]
-    path                = "…"    # the local clone, when it is not beside this checkout
-    domain              = "…"    # the oracle domain of the work done there
-    scope               = […]    # the vocabulary `--scope` is checked against
-    provider_credential = "…"    # the credential class runs there are billed under
-    routine             = "…"    # the routine file a run there follows, hashed into the record
+    path            = "…"        # the local clone, when it is not beside this checkout
+    domain          = "…"        # the oracle domain of the work done there
+    scope           = […]        # the vocabulary `--scope` is checked against
+    routine         = "…"        # the routine file a run there follows, hashed into the record
+
+    [providers.<name>]           # one arm: a model behind a client, under a ledger — `providers`
+    …                            # owns the shape, and this module only carries the tables through
+
+A repository declares what is true of work done there; a provider table declares what is true of
+the arm that did it. The ledger a run is billed under belongs to the second: one repository is
+worked by a vendor arm and a local arm on the same day, and a credential class read from the
+repository would have reported both under whichever was configured there.
 
 `execution_repo` and `streams_repo` are **paths to local clones**, not repository slugs: a flush
 copies files into them, commits and pushes under the person's own identity, and the repository each
@@ -63,7 +70,6 @@ class Repo:
     path: str | None = None
     domain: str | None = None
     scope: tuple[str, ...] = ()
-    provider_credential: object = None
     routine: str | None = None
 
 
@@ -81,6 +87,10 @@ class Config:
     execution_repo: str | None = None
     streams_repo: str | None = None
     repos: dict[str, Repo] = dataclasses.field(default_factory=dict)
+    #: The `[providers.<name>]` tables as the file wrote them. They are carried rather than
+    #: interpreted: what an arm may declare is `providers`' own, and a second opinion here would
+    #: be a second place a table is checked and a first place it is checked differently.
+    providers: dict[str, dict] = dataclasses.field(default_factory=dict)
 
     @property
     def noreply_email(self) -> str:
@@ -91,7 +101,7 @@ class Config:
         """
         return f"{self.bot_user_id}+{self.bot_login}@users.noreply.github.com"
 
-    def _beside(self, value: str) -> str:
+    def beside(self, value: str) -> str:
         """A configured path, absolute. A relative one is read beside the configuration file."""
         raw = os.path.expanduser(value)
         if not os.path.isabs(raw):
@@ -101,22 +111,22 @@ class Config:
     @property
     def key_path(self) -> str:
         """The private key, absolute."""
-        return self._beside(self.private_key)
+        return self.beside(self.private_key)
 
     @property
     def execution_repo_path(self) -> str | None:
         """The clone run records are carried into, absolute."""
-        return self._beside(self.execution_repo) if self.execution_repo else None
+        return self.beside(self.execution_repo) if self.execution_repo else None
 
     @property
     def streams_repo_path(self) -> str | None:
         """The clone session streams are carried into, absolute."""
-        return self._beside(self.streams_repo) if self.streams_repo else None
+        return self.beside(self.streams_repo) if self.streams_repo else None
 
     @property
     def age_identity_path(self) -> str | None:
         """The age identity the key is decrypted with, absolute, or nothing when none is set."""
-        return self._beside(self.age_identity) if self.age_identity else None
+        return self.beside(self.age_identity) if self.age_identity else None
 
     def repo(self, name: str) -> Repo:
         """The `[repos.<name>]` entry, or an empty one — an unconfigured repository is usable.
@@ -173,8 +183,13 @@ def load(path: str | None = None) -> Config:
                            path=table.get("path"),
                            domain=table.get("domain"),
                            scope=tuple(scope),
-                           provider_credential=table.get("provider_credential"),
                            routine=table.get("routine"))
+
+    providers = {}
+    for name, table in (document.get("providers") or {}).items():
+        if not isinstance(table, dict):
+            raise ConfigError(f"{resolved}: [providers.{name}] is not a table")
+        providers[name] = dict(table)
 
     try:
         return Config(
@@ -190,6 +205,7 @@ def load(path: str | None = None) -> Config:
             execution_repo=_scalar(document, github, "execution_repo"),
             streams_repo=_scalar(document, github, "streams_repo"),
             repos=repos,
+            providers=providers,
         )
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"{resolved}: installation_id and bot_user_id must be integers "

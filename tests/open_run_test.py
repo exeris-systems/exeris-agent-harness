@@ -140,7 +140,12 @@ class OpenRunTest(unittest.TestCase):
             '[repos."exeris-agent-harness"]\n'
             'domain = "construction"\n'
             f"scope = {list(SCOPES)!r}\n"
-            'provider_credential = "subscription"\n'
+            "\n"
+            # The arm a run is opened under. The vendor the row names and the ledger it is billed
+            # to are the arm's, which is why they are declared here and not beside the repository.
+            "[providers.claude]\n"
+            'provider = "anthropic"\n'
+            'credential = "subscription"\n'
         )
 
         # The maintainer's own configuration directory is never read: the config path is given
@@ -398,6 +403,18 @@ class OpenRunTest(unittest.TestCase):
         self.assertEqual("a", pairing.get("arm"), pairing)
         self.assertEqual(1, pairing.get("arms_planned"), pairing)
         self.assertEqual("none", pairing.get("baseline"), pairing)
+
+    def test_a_baseline_that_is_neither_human_nor_none_is_refused(self):
+        # A group either has a human arm, whose measurement every row of it carries, or it has
+        # none and can never carry an economic claim. A third value is a row the contract refuses,
+        # and refusing it here is refusing it before the work is done.
+        code = self._cli([
+            "open-run", "--repo", str(self.clone), "--provider", "claude",
+            "--task", "reg:T1", "--group", "G", "--arm", "a", "--arms-planned", "1",
+            "--baseline", "the-last-release",
+        ])
+        self.assertEqual(2, code)
+        self.assertEqual([], list(self.state_root.rglob("manifest.json")))
 
     def test_the_credential_helper_answers_only_for_the_organisation(self):
         self._open_run("--task", "adhoc")

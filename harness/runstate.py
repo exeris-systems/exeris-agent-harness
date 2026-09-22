@@ -200,6 +200,35 @@ exec git interpret-trailers --in-place --if-exists doNothing \\
                       mode=EXECUTABLE_MODE)
 
 
+def baseline_settings(run_dir: str) -> list[tuple[str, str]]:
+    """The whole of what a human baseline binds to its worktree: where its hooks are.
+
+    A baseline is the person's own work and is committed under the person's own identity, so none
+    of the run boundary is written here — no credential helper, no identity, no signing rule. What
+    is bound is the hooks path, because the two hooks a baseline installs are what make the work
+    measurable: the time each commit was made, and the trailer that joins it to the measurement.
+    """
+    return [("core.hooksPath", os.path.join(run_dir, "hooks"))]
+
+
+def write_timing_hook(run_dir: str) -> str:
+    """`<run>/hooks/post-commit` — when each commit of a baseline was made.
+
+    One line per commit, beside the run and in no record: the baseline a group carries is wall
+    time, an outcome and a count of changes, and this log is the evidence under the first of them
+    rather than a field of its own.
+    """
+    log = os.path.join(run_dir, "timing.log")
+    text = f"""\
+#!/bin/sh
+# One line per commit: when it was made, and which commit it was. Evidence beside the run; nothing
+# reads it into a record.
+printf '%s %s\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse HEAD)" \\
+        >> {_shell_value(log)}
+"""
+    return write_text(run_dir, os.path.join("hooks", "post-commit"), text, mode=EXECUTABLE_MODE)
+
+
 #: Variables the run does not inherit. Everything here is a way to reach a credential the run did
 #: not mint, or to configure git past the configuration the run wrote: a person's API tokens, an
 #: agent socket that reaches the forge over ssh without git being involved at all, a helper that
@@ -244,6 +273,10 @@ RUN_ENV_KEYS = (
     "GIT_COMMITTER_EMAIL",
     "EXERIS_RUN",
     "GITHUB_TOKEN",
+    # What the run exports for its adapter: which model it is to launch, and where the task text
+    # is. A person's own command has no business reading either.
+    "EXERIS_MODEL_ID",
+    "EXERIS_PROMPT_FILE",
 )
 
 

@@ -18,25 +18,10 @@ import os
 import re
 
 from .capture import NoRow
-
-#: Which oracle may judge a run in which domain, mirroring the producer table the row contract
-#: publishes. It is a mirror and not a second source: an id absent from it is not writable, because
-#: the row would name a state no reader can look up.
-#:
-#: The keys are the domains the record admits, spelled as the contract spells them. A second
-#: spelling accepted here would be a domain name that resolves to an oracle for the producer and to
-#: nothing for the reader, and a domain whose name averages two oracles' populations is the
-#: meaningless figure the record exists to prevent — so a configuration that names a domain the
-#: contract does not know writes no row.
-ORACLES = {
-    "docs-sweep": ("docs-guardrails", "docs-mutation-v1"),
-    "construction": ("scb", "oracle-selftest"),
-}
-
-#: The construction oracle's own version. The documentation oracle's version is the bundle pinned
-#: in the checkout — the rules the run was subject to — so it is read from the row rather than set
-#: here.
-SCB_VERSION = "1.3"
+# The register of which oracle judges which domain, and the seam that asks it. Imported rather than
+# restated: the judgement on a run record and the judgement on a human baseline are one question,
+# and a record module with its own copy of the register would be the second place it is answered.
+from .oracle import ORACLES, SCB_VERSION, outcome_of
 
 #: The organisation's writing identities: the voice, the pen and the hands. None of them is a
 #: model. A row naming one in `agent.*` puts an identity into the column a comparison across models
@@ -236,22 +221,27 @@ def system_prompt_sha256(prompt_digest: str, routine: str, agents_file: str) -> 
     return hashlib.sha256(body).hexdigest()
 
 
-def oracle(domain: str, bundle: str) -> dict:
+def oracle(domain: str, bundle: str, judgement: dict) -> dict:
     """Which oracle judged the run, at what version, in what calibration state.
 
-    Every suite is `not-run`, and `not-run` is not a pass: none of them has been run as a suite.
-    Naming the suite anyway is how a row says which pass it is waiting for, and the result repeats
-    the status because the field holds a score as it was published and no score was.
+    The id and the version are the register's; the calibration is the judgement's own, because the
+    state of a suite is something the judge knows and the record does not. Naming a suite that has
+    not run is how a row says which pass it is waiting for, and the result repeats the status
+    because the field holds a score as it was published and no score was.
     """
     if not domain:
         raise NoRow("domain-absent", "the configuration declares no domain for this repository")
     if domain not in ORACLES:
         raise NoRow("oracle-unmappable", domain)
-    oracle_id, suite = ORACLES[domain]
+    oracle_id, registered = ORACLES[domain]
+    calibration = dict((judgement or {}).get("calibration") or {})
+    # The suite is the register's wherever the judge named none: a calibration without a suite
+    # names a state no reader can look up, which is the same defect as an unpublished oracle id.
+    calibration["suite"] = calibration.get("suite") or registered
     return {
         "id": oracle_id,
         "version": bundle if oracle_id == "docs-guardrails" else SCB_VERSION,
-        "calibration": {"suite": suite, "status": "not-run", "result": "not-run"},
+        "calibration": calibration,
     }
 
 
@@ -270,26 +260,38 @@ def accounting(credential_class, usage: dict) -> dict:
     return out
 
 
-def assemble(*, manifest: dict, repo_config, facts, visibility: str, bundle: str, dirty: bool,
-             result_commits: list, ended_at: str, capture_version: str, fence: str, ref: str,
-             prompt_digest: str, routine: str, agents_file: str) -> dict:
+def assemble(*, manifest: dict, repo_config, provider: dict, facts, visibility: str, bundle: str,
+             dirty: bool, result_commits: list, ended_at: str, capture_version: str, fence: str,
+             ref: str, prompt_digest: str, routine: str, agents_file: str,
+             judgement: dict) -> dict:
     """The run record, complete, in the order the contract lists its components."""
     started = stamp(manifest["started_at"])
-    wall_time_ms = max(int((stamp(ended_at) - started).total_seconds() * 1000), 0)
+    # The runtime's own figure where it reports one, and the run's own clock otherwise. A client
+    # that times the work it did is closer to the work than a producer that times the command:
+    # between the two lie the harness's own start-up, the push and the pull request.
+    wall_time_ms = facts.get("wall_time_ms")
+    if not isinstance(wall_time_ms, int) or isinstance(wall_time_ms, bool) or wall_time_ms < 0:
+        wall_time_ms = max(int((stamp(ended_at) - started).total_seconds() * 1000), 0)
 
     scope = manifest.get("scope")
     if not scope:
         raise NoRow("scope-absent", "the row contract requires the kind of workload a run was")
 
+    model_id = facts["model_id"]
     agent = {
-        "provider": manifest["provider"],
-        "model_id": facts["model_id"],
-        # The runtime exposes no dated snapshot for the model that takes the turns, so the row
-        # carries the alias marked as unresolved. The bare alias is refused by the contract,
-        # because one alias may name different weights at different times and a row that cannot
-        # tell is worse than a row that says it cannot.
-        "model_snapshot": f"unresolved:{facts['model_id']}",
-        "harness": {"client": facts["client"], "version": facts["version"]},
+        # The vendor whose model took the turns, as the provider table declares it — never the name
+        # of the client that ran it. One vendor is reached through more than one client, and one
+        # client reaches more than one vendor, so the two are separate fields and this is the first.
+        "provider": provider["provider"],
+        "model_id": model_id,
+        # Where the weights are this machine's, the snapshot is their digest: a run that can be
+        # shown to have loaded a file names it. Otherwise the runtime exposes no dated snapshot for
+        # the model that took the turns, and the row carries the alias marked as unresolved — the
+        # bare alias is refused by the contract, because one alias may name different weights at
+        # different times and a row that cannot tell is worse than a row that says it cannot.
+        "model_snapshot": provider.get("model_snapshot") or f"unresolved:{model_id}",
+        "harness": {"client": provider.get("harness_client") or facts["client"],
+                    "version": provider.get("harness_version") or facts["version"]},
         "system_prompt_sha256": system_prompt_sha256(prompt_digest, routine, agents_file),
     }
     refuse_publisher(agent)
@@ -303,12 +305,17 @@ def assemble(*, manifest: dict, repo_config, facts, visibility: str, bundle: str
         "capture_level": facts["capture_level"],
         # Who acted, as opposed to who was asked. It is here and never in `agent.*`.
         "principal": dict(manifest["principal"]),
-        "human_prompts": facts["human_prompts"],
-        "permission_denials": facts["permission_denials"],
         # An empty array is a measurement: the harness owns the run's worktree and watched its
         # branch, so a run that committed nothing is a run that committed nothing.
         "result_commits": list(result_commits),
     }
+    # A count the stream does not carry is absent, never `0`: a run nothing refused and a run
+    # nobody watched would otherwise share one value, and `capture_level` beside them is what a
+    # reader has to tell them apart by.
+    for name in ("human_prompts", "permission_denials"):
+        counted = facts.get(name)
+        if isinstance(counted, int) and not isinstance(counted, bool):
+            execution[name] = counted
 
     row = {
         "run_id": manifest["run_id"],
@@ -327,11 +334,14 @@ def assemble(*, manifest: dict, repo_config, facts, visibility: str, bundle: str
             "dirty": bool(dirty),
         },
         "execution": execution,
-        "accounting": accounting(repo_config.provider_credential, facts["usage"]),
-        "oracle": oracle(repo_config.domain or "", bundle),
-        # The oracle's suite has not been run as a suite, so neither its pass nor its failure is
-        # admissible as a label. Fail-closed says exactly that.
-        "outcome": "UNKNOWN",
+        # The ledger the arm belongs to, declared by the arm. A repository is worked by a vendor
+        # arm and a local arm on the same day, so a class read from the repository would report
+        # both under whichever was configured there.
+        "accounting": accounting(provider.get("credential"), facts["usage"]),
+        "oracle": oracle(repo_config.domain or "", bundle, judgement),
+        # Fail-closed: while the suite has not passed, neither a pass nor a failure is admissible
+        # as a label, whatever the judge answered.
+        "outcome": outcome_of(judgement),
         "instrument": {
             "capture_version": capture_version,
             "fence": fence,
@@ -342,6 +352,14 @@ def assemble(*, manifest: dict, repo_config, facts, visibility: str, bundle: str
     pairing = manifest.get("pairing")
     if pairing and str(manifest["task"]).startswith("reg:"):
         row["pairing"] = dict(pairing)
+        # A group planned with a human arm carries that arm's measurement on every one of its
+        # rows, identically, and the arm ran before this one did. A row of such a group written
+        # without it is a row of a group nobody can interpret, so there is no row.
+        if pairing.get("baseline") == "human":
+            baseline = manifest.get("human_baseline")
+            if not isinstance(baseline, dict) or not baseline:
+                raise NoRow("human-baseline-absent", str(pairing.get("group_id") or ""))
+            row["human_baseline"] = dict(baseline)
     return row
 
 
