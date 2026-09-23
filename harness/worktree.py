@@ -113,6 +113,18 @@ def local_hooks_path(clone: str) -> str:
     return git(clone, "config", "--local", "--get", "core.hooksPath", check=False)
 
 
+def bind_settings(clone: str, worktree: str, settings=()) -> None:
+    """Worktree-scoped configuration, and nothing about identity.
+
+    The scope is the last config git reads, which is why the settings that have to hold inside a
+    tree are written here. What is bound is exactly what is passed: a tree given only a hooks path
+    keeps the identity, the credentials and the signing rules of whoever works in it.
+    """
+    git(clone, "config", "extensions.worktreeConfig", "true")
+    for key, value in settings:
+        git(worktree, "config", "--worktree", "--add", key, value)
+
+
 def bind_identity(clone: str, worktree: str, *, user_name: str, user_email: str,
                   settings=()) -> None:
     """Worktree-scoped `user.*` and the run's boundary, which the extension has to be enabled for.
@@ -125,8 +137,9 @@ def bind_identity(clone: str, worktree: str, *, user_name: str, user_email: str,
     append its credential helper after the run's reset, and replace the run's hooks path outright.
     Order within the scope is preserved, so the reset stays ahead of the scoped helper it clears.
     """
+    # Enabled before the identity is written, because `git config --worktree` refuses without it;
+    # the boundary that follows goes through the same binding a tree with no identity gets.
     git(clone, "config", "extensions.worktreeConfig", "true")
     git(worktree, "config", "--worktree", "user.name", user_name)
     git(worktree, "config", "--worktree", "user.email", user_email)
-    for key, value in settings:
-        git(worktree, "config", "--worktree", "--add", key, value)
+    bind_settings(clone, worktree, settings)

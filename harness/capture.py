@@ -67,6 +67,10 @@ REASONS = (
     "fence-unregistered",
     # An identity the organisation writes with was recorded as the model that did the work.
     "publisher-named-as-agent",
+    # The run is an arm of a group planned with a human arm, and the producer could not read that
+    # arm's measurement. Every row of such a group carries it identically, so a row written without
+    # it is a row of a group nobody can interpret.
+    "human-baseline-absent",
 )
 
 
@@ -89,6 +93,7 @@ class NoRow(Exception):
 #: ``client`` / ``version``  the client that ran it and the version of it — `agent.harness`
 #: ``turns`` / ``tool_calls``            `execution`'s two required counts
 #: ``usage``                 token counts under `accounting.usage`'s own four names
+#: ``wall_time_ms``          what the runtime says the work took, where it says so at all
 #: ``human_prompts``         prompts a person submitted after the first
 #: ``permission_denials``    tool calls the client refused
 #: ``system_prompt_sha256``  the run's own prompt, hashed where it was read. It is the FIRST
@@ -97,5 +102,12 @@ class NoRow(Exception):
 #:                           file in force. The text is hashed here because here is where it is
 #:                           read, and it is not carried further.
 #: ``capture_level``         how much of `execution` this adapter could observe
+#: ``notes``                 lines the producer prints beside the run and writes into no row
+#:
+#: A key a stream does not carry is answered as `None`, which the record reads as absent. That is
+#: the whole of the rule for an optional count: `0` is a measurement of a run nothing refused, and
+#: a runtime that reports no refusals at all has not measured one — so the two never share a value,
+#: and `capture_level` says which of them the row is.
 KEYS = ("path", "sha256", "event_count", "model_id", "client", "version", "turns", "tool_calls",
-        "usage", "human_prompts", "permission_denials", "system_prompt_sha256", "capture_level")
+        "usage", "wall_time_ms", "human_prompts", "permission_denials", "system_prompt_sha256",
+        "capture_level", "notes")

@@ -20,6 +20,7 @@ harness, so what a case asserts is the request that left the process.
 """
 
 import datetime
+import hashlib
 import json
 import os
 import pathlib
@@ -36,6 +37,8 @@ if str(_REPO_ROOT) not in sys.path:
 
 FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"
 SESSION = FIXTURES / "session.jsonl"
+#: The stream the other client writes: one NDJSON event per line, into a file of the run's own.
+AGY_STREAM = FIXTURES / "agy-stream.jsonl"
 FAKE_GH = FIXTURES / "fake_gh.py"
 FIXTURE_CWD = "/tmp/placeholder/wt"
 
@@ -46,6 +49,10 @@ BOT_LOGIN = "exeris-agent[bot]"
 ORG = "exeris-systems"
 OWNER_LOGIN = "a-maintainer"
 SCOPE = "capture"
+#: The arm the fixture opens its runs under: the vendor the row names, and the ledger the run is
+#: billed to. Both are the provider table's, which is where a row's `agent.provider` and
+#: `accounting.mode` come from.
+PROVIDER = "anthropic"
 DOMAIN = "construction"
 DOCUMENTATION_DOMAIN = "docs-sweep"
 CREDENTIAL = "subscription"
@@ -77,9 +84,31 @@ AGENTS_MD = "# Agent instructions\n\nplaceholder: what an agent working here is 
 #: so a fixture that seeded none would be a fixture in which no run can be recorded.
 CLIENT_VERSION = "2.1.278"
 FENCE = f"2026-09-19-harness-claude-cc-{CLIENT_VERSION.replace('.', '-')}"
-REGISTER_ENTRY = (f"| `{FENCE}` | 2026-09-19 | harness, claude | placeholder: the producer these "
-                  f"tests run as, entered so its rows have an id to resolve | placeholder entry "
-                  f"|\n")
+
+#: The other arm: its client, the version the fixture stream was produced under, and its own fence.
+#: One producer at one client version is one fence, so a second adapter is a second entry and never
+#: a second spelling of the first.
+AGY_PROVIDER = "google"
+AGY_MODEL = "placeholder-model-1"
+AGY_CLIENT = "antigravity"
+AGY_VERSION = "1.9.9"
+AGY_FENCE = f"2026-09-19-harness-antigravity-cc-{AGY_VERSION.replace('.', '-')}"
+
+#: The local arm: weights this machine holds, run through the same client as the vendor arm. A
+#: model snapshot is instrument state, so the two differ in nothing the first two segments of an id
+#: carry and the weights digest is what keeps their rows apart.
+LOCAL_WEIGHTS = b"placeholder: a file in the shape weights have, and not a model\n"
+LOCAL_SNAPSHOT = hashlib.sha256(LOCAL_WEIGHTS).hexdigest()
+LOCAL_FENCE = f"{FENCE}-w-{LOCAL_SNAPSHOT[:12]}"
+
+
+def _entry(fence, producer):
+    return (f"| `{fence}` | 2026-09-19 | harness, {producer} | placeholder: the producer these "
+            f"tests run as, entered so its rows have an id to resolve | placeholder entry |\n")
+
+
+REGISTER_ENTRIES = (_entry(FENCE, "claude"), _entry(AGY_FENCE, "antigravity"),
+                    _entry(LOCAL_FENCE, "claude over local weights"))
 
 #: Where the row contract is read from. A checkout that does not have it skips these cases rather
 #: than checking a row against a copy: a second copy of a contract is a second answer.
@@ -108,7 +137,8 @@ def _register(published) -> str:
     """
     lines = published.read_text(encoding="utf-8").splitlines(keepends=True)
     last = max(index for index, line in enumerate(lines) if line.startswith("| `"))
-    lines.insert(last + 1, REGISTER_ENTRY)
+    for offset, entry in enumerate(REGISTER_ENTRIES):
+        lines.insert(last + 1 + offset, entry)
     return "".join(lines)
 
 
@@ -270,8 +300,29 @@ class HarnessFixture(unittest.TestCase):
             '[repos."exeris-agent-harness"]\n'
             f'domain = "{DOMAIN}"\n'
             f'scope = ["{SCOPE}"]\n'
-            f'provider_credential = "{CREDENTIAL}"\n'
+            "\n"
+            # The arm, not the repository: one repository is worked by more than one arm, and the
+            # vendor and the ledger are properties of the arm that did the work.
+            "[providers.claude]\n"
+            f'provider = "{PROVIDER}"\n'
+            f'credential = "{CREDENTIAL}"\n'
+            "\n"
+            "[providers.antigravity]\n"
+            f'provider = "{AGY_PROVIDER}"\n'
+            f'model_id = "{AGY_MODEL}"\n'
+            f'credential = "{CREDENTIAL}"\n'
+            'adapter = "antigravity"\n'
         )
+
+    def configure_domain(self, domain):
+        """The domain the configuration declares for the repository runs are opened against.
+
+        It decides which oracle judges the work, so a case about an oracle sets it here rather than
+        calling the seam directly: the path from a configured domain to a judged row is the part
+        that can break.
+        """
+        self.config_path.write_text(self.config_path.read_text().replace(
+            f'domain = "{DOMAIN}"', f'domain = "{domain}"'))
 
     # ---- the harness under test --------------------------------------------------
 
@@ -299,19 +350,27 @@ class HarnessFixture(unittest.TestCase):
         self.assertEqual(0, code, f"open-run refused: exit {code}")
         return self.run_dir()
 
-    def run_dir(self):
-        manifests = sorted(self.state_root.rglob("manifest.json"))
-        self.assertEqual(1, len(manifests), f"expected one run: {manifests}")
-        return manifests[0].parent
+    def run_dir(self, kind="model"):
+        """The directory of the run a case means.
 
-    def manifest(self):
-        return json.loads((self.run_dir() / "manifest.json").read_text())
+        A machine holds more than one when a group has both its arms: a human baseline is a run
+        too, and it is the one kind of run that mints nothing and writes no row. `kind` is which of
+        them is being asked about, and the newest of that kind is the answer — run directories are
+        named by a ULID, so directory order is the order they were opened in.
+        """
+        found = [path.parent for path in sorted(self.state_root.rglob("manifest.json"))
+                 if (json.loads(path.read_text()).get("kind") or "model") == kind]
+        self.assertTrue(found, f"no {kind} run under {self.state_root}")
+        return found[-1]
 
-    def worktree(self):
-        return pathlib.Path(self.manifest()["worktree"])
+    def manifest(self, kind="model"):
+        return json.loads((self.run_dir(kind) / "manifest.json").read_text())
 
-    def run_id(self):
-        return self.manifest()["run_id"]
+    def worktree(self, kind="model"):
+        return pathlib.Path(self.manifest(kind)["worktree"])
+
+    def run_id(self, kind="model"):
+        return self.manifest(kind)["run_id"]
 
     def commit(self, message="a change", name="change.txt"):
         """One commit inside the run's tree, stamped by the run's own hook."""
@@ -355,6 +414,30 @@ class HarnessFixture(unittest.TestCase):
         path = directory / name
         path.write_text(text, encoding="utf-8")
         return path
+
+    def place_agy_stream(self, *, source=AGY_STREAM, text=None, version=AGY_VERSION):
+        """The stream the other client's launcher would have redirected into the run's directory.
+
+        Beside it, the version the launcher recorded when it started: the version that ran is the
+        version that was installed when it ran, and the one installed on the machine these tests
+        run on is neither.
+        """
+        run_dir = self.run_dir()
+        stream = run_dir / "agy.jsonl"
+        stream.write_text(text if text is not None
+                          else pathlib.Path(source).read_text(encoding="utf-8"), encoding="utf-8")
+        (run_dir / "agy.version").write_text(f"{version}\n", encoding="utf-8")
+        return stream
+
+    def open_agy_run(self, *extra):
+        """A run of the other arm. Its adapter takes the task on the command line, so a prompt
+        file is what the harness has to pass it and what the row's digest is taken from."""
+        prompt = self.tmp / "task.txt"
+        prompt.write_text("placeholder: the task this run was given\n", encoding="utf-8")
+        code = self.cli(["open-run", "--repo", str(self.clone), "--provider", "antigravity",
+                         "--task", TASK, "--scope", SCOPE, "--prompt-file", str(prompt), *extra])
+        self.assertEqual(0, code, f"open-run refused: exit {code}")
+        return self.run_dir()
 
     # ---- what the fake `gh` recorded ---------------------------------------------
 

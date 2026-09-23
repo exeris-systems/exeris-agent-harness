@@ -23,17 +23,17 @@ import hashlib
 import importlib
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
 
-from . import ROOT, VERSION, capture, config, record, runstate, token, ulid, worktree
+from . import (ROOT, VERSION, capture, config, oracle, providers, record, runstate, token, ulid,
+               worktree)
 # Bound here rather than used through the module, because this name is the seam: everything that
 # reaches git or the forge is constructed from it, so substituting it substitutes both halves at
 # once and a test can replace the forge while keeping git.
 from .runner import CommandError, GhError, Runner
-
-PROVIDERS = ("claude", "codex", "gemini")
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -86,8 +86,141 @@ def _pairing(args) -> dict:
     missing = [flag for flag, value in dependent.items() if value is None]
     if missing:
         raise Refused(f"--group without {', '.join(missing)}; a pairing is all four or none")
+    # Two values and no third: a group either has a human arm, whose measurement every row of it
+    # carries, or it has none and can never carry an economic claim. Anything else is a row the
+    # contract refuses, and refusing it here is refusing it before the work is done.
+    if args.baseline not in ("human", "none"):
+        raise Refused(f"--baseline {args.baseline!r} is neither `human` nor `none`")
     return {"group_id": args.group, "arm": args.arm,
             "arms_planned": args.arms_planned, "baseline": args.baseline}
+
+
+#: What a human baseline says about the work, as the row contract names it. Nothing about the
+#: person: the moment this object needs a field about the human rather than about the work, it
+#: stops being a field on a row and becomes a record that rows reference.
+BASELINE_FILE = "baseline.json"
+BASELINE_KIND = "baseline"
+
+
+def _checked_baseline(value, where: str) -> dict:
+    """A human baseline, in the shape every row of its group has to carry byte for byte.
+
+    Checked here rather than trusted, because it is copied onto rows this producer writes: a
+    baseline that does not survive the contract would be discovered at the inbox, one flush after
+    the arms it was supposed to make interpretable had run.
+    """
+    if not isinstance(value, dict):
+        raise Refused(f"{where} does not carry a human baseline object")
+    out = {}
+    wall = value.get("wall_time_ms")
+    if not isinstance(wall, int) or isinstance(wall, bool) or wall < 0:
+        raise Refused(f"{where}: the human baseline states no wall_time_ms")
+    out["wall_time_ms"] = wall
+    outcome = value.get("outcome")
+    if outcome not in oracle.OUTCOMES:
+        raise Refused(f"{where}: the human baseline's outcome is not one of "
+                      f"{', '.join(oracle.OUTCOMES)}")
+    out["outcome"] = outcome
+    changes = value.get("changes")
+    if changes is not None:
+        if not isinstance(changes, dict):
+            raise Refused(f"{where}: the human baseline's changes are not an object")
+        counted = {name: changes[name] for name in ("files_changed", "insertions", "deletions")
+                   if isinstance(changes.get(name), int) and not isinstance(changes[name], bool)}
+        if counted:
+            out["changes"] = counted
+    return out
+
+
+def _baseline_in_file(path: str) -> dict | None:
+    """The group's human baseline as the group record carries it, or nothing where it carries none.
+
+    The registry is another repository's, so the record reaches the harness as a file a person
+    points at. Either shape is read: the group record itself, under its `human_baseline` key, and
+    the measurement on its own, which is what `baseline --close` prints.
+    """
+    try:
+        with open(os.path.expanduser(path), encoding="utf-8") as handle:
+            document = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise Refused(f"--group-file {path}: {exc}") from None
+    if isinstance(document, dict) and document.get("human_baseline") is not None:
+        return _checked_baseline(document["human_baseline"], f"--group-file {path}")
+    if isinstance(document, dict) and "wall_time_ms" in document:
+        return _checked_baseline(document, f"--group-file {path}")
+    return None
+
+
+def _baseline_on_this_machine(group: str, task: str) -> dict | None:
+    """The human baseline a `baseline` run of this group staged here, where one did.
+
+    A producer knows about the arms it ran itself, so a group whose human arm was measured on this
+    machine needs no file passed to it. Two baselines that do not agree are refused rather than
+    chosen between: every row of a group carries this object identically, and a group with two of
+    them is a group nobody can interpret.
+
+    The task is matched as well as the group, because a group is one planned task and a human arm
+    that measured another one measured different work. Nothing downstream can see that: the object
+    is copied onto every arm of the group, so it is identical wherever it is checked, and identical
+    is all the far end can ask about it. A baseline of this group under another task is named in a
+    refusal rather than passed over, because a miss here surfaces as the refusal that says the
+    group has no baseline at all, which sends the person to measure one they already have.
+    """
+    found, elsewhere = {}, {}
+    for run_dir in runstate.all_runs():
+        manifest = runstate.read_manifest(run_dir) or {}
+        if manifest.get("kind") != BASELINE_KIND or manifest.get("group") != group:
+            continue
+        path = os.path.join(run_dir, "staging", BASELINE_FILE)
+        if manifest.get("task") != task:
+            if os.path.isfile(path):
+                elsewhere[str(manifest.get("task"))] = path
+            continue
+        try:
+            with open(path, encoding="utf-8") as handle:
+                found[json.dumps(json.load(handle), sort_keys=True)] = path
+        except (OSError, json.JSONDecodeError):
+            continue
+    if not found and elsewhere:
+        raise Refused(f"group {group} has a human baseline staged on this machine and it measured "
+                      f"{', '.join(sorted(elsewhere))}, not {task}: "
+                      f"{', '.join(sorted(elsewhere.values()))}")
+    if not found:
+        return None
+    if len(found) > 1:
+        raise Refused(f"group {group} has {len(found)} human baselines staged on this machine "
+                      f"and they differ: {', '.join(sorted(found.values()))}")
+    body, path = next(iter(found.items()))
+    return _checked_baseline(json.loads(body), path)
+
+
+def _human_baseline(args, pairing: dict) -> dict | None:
+    """The human arm's measurement, where the group was planned with one.
+
+    The human arm runs first, so that its measurement is on every model row of the group when that
+    row is written and no row is rewritten afterwards — and so that the human has not seen a
+    model's output. This is where that protocol is enforced: a model arm of a group declared with a
+    human baseline does not open until the baseline exists.
+
+    `--no-baseline-required` opens the arm anyway. It does not fabricate a baseline: the run
+    happens, its work is pushed, and its row is refused with the reason that says the group's
+    baseline could not be read.
+    """
+    if not pairing or pairing.get("baseline") != "human":
+        return None
+    required = True if args.baseline_required is None else bool(args.baseline_required)
+    # The ref as a run records it, so that the arm's task and a staged baseline's are compared in
+    # one spelling. A pairing is only ever a `reg:` task, which is the one class this resolves to
+    # the same value for whatever run id it is given.
+    task = _task_ref(args.task, "0" * ulid.LENGTH)
+    measured = (_baseline_in_file(args.group_file) if args.group_file
+                else _baseline_on_this_machine(pairing["group_id"], task))
+    if measured is None and required:
+        raise Refused(f"group {pairing['group_id']} is planned with a human arm and no human "
+                      f"baseline exists yet: run `exeris-agent baseline --repo … --task "
+                      f"{args.task} --group {pairing['group_id']}` first, or pass --group-file "
+                      f"naming the group record that carries one")
+    return measured
 
 
 def _prompt_digest(path: str | None) -> str | None:
@@ -111,11 +244,41 @@ def _scope(args, repo_config) -> str | None:
     return args.scope
 
 
-def _adapter(provider: str) -> str:
-    launcher = os.path.join(ROOT, "adapters", provider, "launch.sh")
+def _launcher(adapter: str) -> str:
+    """The program `--launch` execs in the run's worktree.
+
+    Named apart from the session loader below because the two are different halves of one adapter
+    and take the same argument: one is a path handed to `execve`, the other a module the record is
+    assembled from, and a name that answered for both would hand `execve` a module.
+    """
+    launcher = os.path.join(ROOT, "adapters", adapter, "launch.sh")
     if not os.path.isfile(launcher):
-        raise Refused(f"no adapter for {provider} at {launcher}")
+        raise Refused(f"no launcher for the {adapter} adapter at {launcher}")
     return launcher
+
+
+def _provider(cfg, args):
+    """The arm this run is, from the provider table `--provider` names."""
+    try:
+        return providers.resolve(cfg, args.provider, prompt_file=args.prompt_file)
+    except providers.ProviderError as exc:
+        raise Refused(str(exc)) from None
+
+
+def _launch_values(arm, prompt_file: str | None) -> dict:
+    """What the run's environment carries for the adapter, beside what it carries for git.
+
+    The provider table's own variables, and the two the harness itself knows: which model the
+    adapter is to launch, and where the task text is. Both are needed by a client that takes its
+    task on the command line, and neither is a secret — the task's digest is on the row and its
+    text is a file the person wrote.
+    """
+    values = dict(arm.env)
+    if arm.model_id:
+        values["EXERIS_MODEL_ID"] = arm.model_id
+    if prompt_file:
+        values["EXERIS_PROMPT_FILE"] = os.path.abspath(os.path.expanduser(prompt_file))
+    return values
 
 
 def cmd_open_run(args) -> int:
@@ -125,12 +288,14 @@ def cmd_open_run(args) -> int:
     # invocation leaves no run behind to be cleaned up or, worse, reported on.
     _task_ref(args.task, "0" * ulid.LENGTH)
     pairing = _pairing(args)
+    arm = _provider(cfg, args)
+    human_baseline = _human_baseline(args, pairing)
     prompt_sha256 = _prompt_digest(args.prompt_file)
     clone = worktree.resolve_clone(args.repo, cfg)
     slug = worktree.origin_slug(clone)
     scope = _scope(args, cfg.repo(slug.split("/", 1)[1]))
     base_branch = worktree.default_branch(clone)
-    launcher = _adapter(args.provider) if args.launch else None
+    launcher = _launcher(arm.adapter) if args.launch else None
 
     # A pull request this run's work becomes carries exactly one `Owner:`, naming the member
     # accountable for it. The manifest is where that line will be built from, so a configuration
@@ -173,6 +338,10 @@ def cmd_open_run(args) -> int:
 
         values = runstate.env_values(run_dir, run_id=run_id, token=minted["token"],
                                      user_name=cfg.bot_login, user_email=cfg.noreply_email)
+        # The arm's own variables, added after the run's: a provider table cannot name one of the
+        # run's, which is checked where the table is read, so the two sets do not overlap and the
+        # order below is a statement rather than a precedence.
+        values.update(_launch_values(arm, args.prompt_file))
         runstate.write_env(run_dir, values)
 
         manifest = {
@@ -180,6 +349,11 @@ def cmd_open_run(args) -> int:
             "task": task,
             "repo": slug,
             "provider": args.provider,
+            # The arm, as the table declared it and as the row will carry it. Recorded when the run
+            # opens because a table edited afterwards would otherwise rename what already ran; the
+            # weights digest is here for the same reason, and because a file measured in gigabytes
+            # is read once.
+            "provider_table": arm.recorded(),
             "started_at": _now(),
             "worktree": tree,
             "branch": branch,
@@ -198,6 +372,8 @@ def cmd_open_run(args) -> int:
             manifest["pairing"] = pairing
         if prompt_sha256:
             manifest["prompt_sha256"] = prompt_sha256
+        if human_baseline:
+            manifest["human_baseline"] = dict(human_baseline)
         runstate.write_manifest(run_dir, manifest)
     except BaseException:
         runstate.discard(run_dir)
@@ -275,6 +451,34 @@ AGENTS_FILE = "AGENTS.md"
 #: second time or ask for a second pull request.
 CLOSED = "closed.json"
 
+#: What the oracle found, gate by gate, staged with the run and carried into no inbox. The row says
+#: which oracle judged the run and what it concluded; the gates behind that are this oracle's own
+#: internals, and a run whose row reads `UNKNOWN` over passing gates is explained here rather than
+#: in a column nobody could compare across oracles.
+JUDGEMENT_FILE = "judgement.json"
+
+
+def _judged(cfg, worktree_path: str, domain: str, run_id: str) -> dict:
+    """Ask the seam, and say beside the run what it could not read.
+
+    The judge is given paths and never the configuration, so that what an oracle is shown is
+    visible at the call. Anything it could not read is printed rather than swallowed: `UNKNOWN`
+    because no oracle was there and `UNKNOWN` because the gates found nothing to judge are the
+    same word on the row, and the difference is a person's to act on.
+    """
+    judgement = oracle.judge(worktree_path, domain or "",
+                             execution_repo=cfg.execution_repo_path,
+                             index=cfg.docs_index_path)
+    if judgement.get("reason"):
+        print(f"exeris-agent: {run_id}: {judgement['reason']}", file=sys.stderr)
+    return judgement
+
+
+def _stage_judgement(run_dir: str, judgement: dict, *, run_id: str, domain: str) -> None:
+    body = json.dumps(oracle.evidence(judgement, run_id=run_id, domain=domain or ""),
+                      indent=2, sort_keys=True) + "\n"
+    runstate.write_text(run_dir, os.path.join("staging", JUDGEMENT_FILE), body)
+
 
 def _run_environment(run_dir: str, manifest: dict, cfg) -> dict:
     """The environment the run's own calls are made in — the one `open-run` printed.
@@ -297,10 +501,10 @@ def _run_environment(run_dir: str, manifest: dict, cfg) -> dict:
     return environment
 
 
-def _adapter(provider: str):
-    """The provider's session adapter, or nothing where the checkout carries none."""
+def _session_module(adapter: str):
+    """The adapter's session half, or nothing where the checkout carries none."""
     try:
-        return importlib.import_module(f"adapters.{provider}.session")
+        return importlib.import_module(f"adapters.{adapter}.session")
     except ImportError:
         return None
 
@@ -354,17 +558,19 @@ def _title(net, worktree_path: str, commits: list, run_id: str) -> str:
 
 
 def _row(args, cfg, net, manifest, *, worktree_path, visibility, dirty, commits,
-         ended_at) -> tuple[dict | None, str | None, str | None]:
+         ended_at, judgement) -> tuple[dict | None, str | None, str | None]:
     """`(row, session path, reason)` — the run record, or why there is not one.
 
     Every refusal reaches here as `NoRow` and leaves as a reason, because a run that cannot be
     recorded is not a run that failed: its commits are pushed and its pull request is open, and
     what is missing is the observation.
     """
+    arm = manifest.get("provider_table") or {}
+    adapter = arm.get("adapter") or manifest["provider"]
     try:
-        module = _adapter(manifest["provider"])
+        module = _session_module(adapter)
         if module is None:
-            raise capture.NoRow("adapter-identity-only", manifest["provider"])
+            raise capture.NoRow("adapter-identity-only", adapter)
         session = module.locate(manifest, override=args.session)
         # An adapter with no search to make answers the pair rather than raising, because it has
         # nothing to have failed at: there is no log it has ever read.
@@ -372,6 +578,11 @@ def _row(args, cfg, net, manifest, *, worktree_path, visibility, dirty, commits,
             named = session[1] if isinstance(session, (tuple, list)) and len(session) > 1 else None
             raise capture.NoRow(named or "adapter-identity-only")
         facts = module.read(session)
+        # What the adapter measured but the row has no field for. It is printed beside the run and
+        # written nowhere: a shape nobody has measured is learned from a run that had one, and a
+        # count whose meaning is unchecked does not belong in a column.
+        for note in facts.get("notes") or ():
+            print(f"exeris-agent: {manifest['run_id']}: {note}", file=sys.stderr)
 
         repo_config = cfg.repo(manifest["repo"].split("/", 1)[1])
         routine = ""
@@ -393,6 +604,7 @@ def _row(args, cfg, net, manifest, *, worktree_path, visibility, dirty, commits,
         row = record.assemble(
             manifest=manifest,
             repo_config=repo_config,
+            provider=arm,
             facts=facts,
             visibility=visibility,
             bundle=bundle,
@@ -402,8 +614,14 @@ def _row(args, cfg, net, manifest, *, worktree_path, visibility, dirty, commits,
             capture_version=record.capture_version(cfg.execution_repo_path or ""),
             # Resolved in the register the contract publishes, never minted from this run's own
             # date: an id no entry carries is a mark nobody can say they are on the far side of.
-            fence=record.fence(cfg.execution_repo_path or "", manifest["provider"],
-                               facts["version"]),
+            # The producer is the harness and the adapter that read the run — never the model, and
+            # never the arm's own name: two arms read by one adapter are two rows under one fence,
+            # and what differs between them is on the rows themselves. The arm's weights are the
+            # exception and are passed: they are instrument state, so rows either side of a change
+            # to them are not one population.
+            fence=record.fence(cfg.execution_repo_path or "", adapter,
+                               arm.get("harness_version") or facts["version"],
+                               arm.get("model_snapshot")),
             ref=record.stream_ref(cfg.org, os.path.basename(cfg.streams_repo_path or ""), date,
                                   manifest["repo"].split("/", 1)[1], manifest["run_id"]),
             # The prompt as it was passed, where the run was given one, and otherwise the prompt
@@ -412,6 +630,11 @@ def _row(args, cfg, net, manifest, *, worktree_path, visibility, dirty, commits,
             prompt_digest=manifest.get("prompt_sha256") or facts.get("system_prompt_sha256") or "",
             routine=routine,
             agents_file=agents_file,
+            # Asked once, of the seam that owns the question, and asked before the branch was
+            # pushed so that what was judged is what the run produced. A judgement and the state
+            # of the suite behind it travel together, so that a label is never read apart from
+            # what makes it admissible.
+            judgement=judgement,
         )
         return row, session, None
     except capture.NoRow as refusal:
@@ -426,6 +649,16 @@ def cmd_close_run(args) -> int:
     manifest = runstate.read_manifest(run_dir)
     if manifest is None:
         raise Refused(f"no run {args.run} under {runstate.runs_root()}")
+    if manifest.get("kind") == BASELINE_KIND:
+        raise Refused(f"{args.run} is a human baseline and not a model arm: it holds no identity "
+                      f"to push as and produces no row — close it with `baseline --close`")
+    if not manifest.get("provider_table"):
+        # The arm is recorded when the run opens, so a manifest without one describes a run this
+        # producer cannot say anything about: which vendor, which ledger, which snapshot. Refused
+        # before anything is pushed, because acting as the identity for a run that can never be
+        # recorded is the one thing this command must not do quietly.
+        raise Refused(f"the manifest of {args.run} names no provider table; it was opened by a "
+                      f"harness that did not record the arm, and nothing here can reconstruct it")
     staging = os.path.join(run_dir, "staging")
     if os.path.exists(os.path.join(staging, CLOSED)):
         raise Refused(f"{args.run} was closed already; what it staged is under {staging}")
@@ -456,6 +689,13 @@ def cmd_close_run(args) -> int:
         print(f"exeris-agent: {len(unattributed)} unattributed-commit on {branch} — no "
               f"`{trailer}` trailer: {', '.join(sha[:8] for sha in unattributed)}", file=sys.stderr)
 
+    # Judged at the head the run left, before anything of it has gone anywhere. The oracle reads a
+    # tree, so the tree it reads has to be the one the commits above produced: a judgement taken
+    # after a push would still be honest, and one taken after a merge or a rebase would not be, and
+    # the order is what keeps that from ever being a question.
+    domain = cfg.repo(repo.split("/", 1)[1]).domain
+    judgement = _judged(cfg, worktree_path, domain, run_id)
+
     net.git(worktree_path, "push", "origin", f"HEAD:refs/heads/{branch}", env=environment)
 
     pull_request = None
@@ -475,10 +715,13 @@ def cmd_close_run(args) -> int:
     visibility = _visibility(net, repo, environment)
     row, session, reason = _row(args, cfg, net, manifest, worktree_path=worktree_path,
                                 visibility=visibility, dirty=dirty, commits=commits,
-                                ended_at=ended_at)
+                                ended_at=ended_at, judgement=judgement)
 
     date = record.date_of(manifest["started_at"])
     os.makedirs(staging, mode=runstate.DIR_MODE, exist_ok=True)
+    # Staged whether or not there is a row. A run the record could not be assembled for was judged
+    # all the same, and the gates are the one account of it that survives.
+    _stage_judgement(run_dir, judgement, run_id=run_id, domain=domain)
     if row is not None:
         # The stream is copied rather than referenced: the client's own log is the person's and may
         # be rotated or removed, and the row's digest has to keep naming something that exists.
@@ -516,6 +759,158 @@ def _remove_worktree(net, worktree_path: str, dirty: bool) -> None:
     common = net.git(worktree_path, "rev-parse", "--path-format=absolute", "--git-common-dir")
     clone = os.path.dirname(common.rstrip("/"))
     net.git(clone, "worktree", "remove", worktree_path)
+
+
+#: `git diff --shortstat`, as git writes it. A clause git omits is a count of zero and is read as
+#: one: the diff was taken, and what it did not report it did not contain.
+_SHORTSTAT = {
+    "files_changed": re.compile(r"(\d+) files? changed"),
+    "insertions": re.compile(r"(\d+) insertions?\(\+\)"),
+    "deletions": re.compile(r"(\d+) deletions?\(-\)"),
+}
+
+
+def _changes(net, worktree_path: str, base: str) -> dict | None:
+    """What the work changed, from the diff between the commit it started from and its head.
+
+    Nothing where the diff could not be taken. A baseline whose changes are absent is still a
+    baseline — wall time and outcome are what the field requires — and a zeroed count for a diff
+    nobody read would be a measurement of nothing.
+    """
+    try:
+        summary = net.git(worktree_path, "diff", "--shortstat", f"{base}..HEAD")
+    except CommandError:
+        return None
+    counted = {}
+    for name, pattern in _SHORTSTAT.items():
+        found = pattern.search(summary or "")
+        counted[name] = int(found.group(1)) if found else 0
+    return counted
+
+
+def cmd_baseline(args) -> int:
+    """The human arm: a worktree the person works in as themselves, and what it measured.
+
+    It is the other half of a paired comparison, and the half nothing else produces. A model arm's
+    row can carry a cost and a count of turns and still say nothing about whether the work was
+    worth doing at that price — that reading needs a human reference point, measured on the same
+    task, under the same oracle, before any model arm ran.
+
+    So this command opens a tree and binds almost nothing to it. No token is minted, no identity is
+    written, no run environment is exported: the commits are the person's, authored as themselves,
+    and what the harness adds is the hook that times them and the trailer that joins them to this
+    measurement.
+    """
+    if args.close:
+        return _close_baseline(args)
+    return _open_baseline(args)
+
+
+def _open_baseline(args) -> int:
+    cfg = config.load()
+    for flag, value in (("--repo", args.repo), ("--task", args.task), ("--group", args.group)):
+        if not value:
+            raise Refused(f"baseline requires {flag}")
+    if args.task == "adhoc":
+        # A baseline exists to be carried onto the rows of a group, and a group is a plan. An
+        # unplanned task is an arm of nothing, so a baseline of one could be carried nowhere.
+        raise Refused("baseline requires --task reg:<id>; a human arm measures a planned task")
+    task = _task_ref(args.task, "0" * ulid.LENGTH)
+
+    clone = worktree.resolve_clone(args.repo, cfg)
+    slug = worktree.origin_slug(clone)
+    repo_config = cfg.repo(slug.split("/", 1)[1])
+    scope = _scope(args, repo_config)
+    base_branch = worktree.default_branch(clone)
+
+    run_id = ulid.new()
+    run_dir = runstate.create(run_id)
+    try:
+        tree = os.path.join(run_dir, "wt")
+        branch = f"baseline/{ulid.short(run_id)}"
+        base_sha = worktree.add(clone, tree, branch, base_branch)
+        worktree.bind_settings(clone, tree, runstate.baseline_settings(run_dir))
+        runstate.write_hook(run_dir, run_id)
+        runstate.write_timing_hook(run_dir)
+        runstate.write_manifest(run_dir, {
+            # What this run is, said in the manifest rather than inferred from what it lacks: a
+            # baseline holds no token and writes no row, and a command that guessed at the kind
+            # from a missing file would treat a half-opened model arm as a human one.
+            "kind": BASELINE_KIND,
+            "run_id": run_id,
+            "task": task,
+            "repo": slug,
+            "group": args.group,
+            "domain": repo_config.domain,
+            "scope": scope,
+            "started_at": _now(),
+            "worktree": tree,
+            "branch": branch,
+            "base_sha": base_sha,
+            "harness": {"client": "exeris-agent-harness", "version": VERSION},
+        })
+    except BaseException:
+        runstate.discard(run_dir)
+        worktree.prune(clone)
+        raise
+
+    print(f"cd {tree}")
+    print(f"exeris-agent: {run_id} is a human baseline of group {args.group}; it is worked under "
+          f"your own git identity and no run environment is sourced. When the work is done: "
+          f"`exeris-agent baseline --close --run {run_id}`", file=sys.stderr)
+    return EXIT_OK
+
+
+def _close_baseline(args) -> int:
+    if not args.run:
+        raise Refused("baseline --close requires --run <ULID>")
+    if not ulid.is_ulid(args.run):
+        raise Refused(f"--run {args.run!r} is not a run id")
+    run_dir = runstate.path(args.run)
+    manifest = runstate.read_manifest(run_dir)
+    if manifest is None:
+        raise Refused(f"no run {args.run} under {runstate.runs_root()}")
+    if manifest.get("kind") != BASELINE_KIND:
+        raise Refused(f"{args.run} is a model arm, not a human baseline; close it with "
+                      f"`close-run`")
+    staged = os.path.join(run_dir, "staging", BASELINE_FILE)
+    if os.path.exists(staged):
+        # Closing twice would measure the time between the work and the second close, which is not
+        # the time the work took.
+        raise Refused(f"{args.run} was closed already; what it measured is in {staged}")
+
+    worktree_path = manifest["worktree"]
+    if not os.path.isdir(worktree_path):
+        raise Refused(f"the worktree of {args.run} is gone: {worktree_path}")
+
+    net = Runner()
+    ended_at = _now()
+    wall_time_ms = max(int((record.stamp(ended_at)
+                            - record.stamp(manifest["started_at"])).total_seconds() * 1000), 0)
+    # The same judge the run record's outcome comes from, asked the same way, over the same kind of
+    # tree. A baseline judged by anything else is not a baseline: the comparison it exists for is a
+    # comparison of outcomes, and two arms measured by two instruments compare the instruments.
+    domain = manifest.get("domain") or ""
+    judgement = _judged(config.load(), worktree_path, domain, args.run)
+    _stage_judgement(run_dir, judgement, run_id=args.run, domain=domain)
+    baseline = {"wall_time_ms": wall_time_ms, "outcome": oracle.outcome_of(judgement)}
+    changes = _changes(net, worktree_path, manifest["base_sha"])
+    if changes is None:
+        print(f"exeris-agent: the diff of {args.run} could not be taken; the baseline states its "
+              f"time and its outcome and no count of changes", file=sys.stderr)
+    else:
+        baseline["changes"] = changes
+
+    body = json.dumps(baseline, indent=2, sort_keys=True) + "\n"
+    runstate.write_text(run_dir, os.path.join("staging", BASELINE_FILE), body)
+    # The registry is another repository's, so the group record is updated by the person. What is
+    # printed is exactly what a model arm of this group will carry, because every row of a group
+    # carries this object identically and a re-typed copy is a group that cannot be interpreted.
+    print(body, end="")
+    print(f"exeris-agent: paste this as `human_baseline` on the record of group "
+          f"{manifest.get('group')}; a model arm opened on this machine reads it from "
+          f"{staged} until then", file=sys.stderr)
+    return EXIT_OK
 
 
 def _staged(kind: str):
@@ -945,8 +1340,9 @@ def parser() -> argparse.ArgumentParser:
     open_run.add_argument("--task", required=True, metavar="reg:<id>|adhoc",
                           help="the registry entry this run executes, or `adhoc` for an "
                                "unplanned run, which is capturable but never paired")
-    open_run.add_argument("--provider", required=True, choices=PROVIDERS,
-                          help="which adapter --launch uses")
+    open_run.add_argument("--provider", required=True, metavar="<name>",
+                          help="the arm this run is: a [providers.<name>] table, or one of the "
+                               "built-in defaults claude, codex, gemini")
     open_run.add_argument("--scope", metavar="<scope>",
                           help="the scope within the repository, checked against the vocabulary "
                                "the configuration declares for it")
@@ -955,13 +1351,41 @@ def parser() -> argparse.ArgumentParser:
     open_run.add_argument("--arm", metavar="<name>", help="this run's arm of --group")
     open_run.add_argument("--arms-planned", type=int, metavar="<n>",
                           help="how many arms --group is planned to have")
-    open_run.add_argument("--baseline", metavar="<ref>|none",
-                          help="the baseline this arm is measured against")
+    open_run.add_argument("--baseline", metavar="human|none",
+                          help="whether --group was planned with a human arm")
+    open_run.add_argument("--group-file", metavar="<path>",
+                          help="the group's record, read for the human baseline every row of a "
+                               "human-baselined group carries")
+    open_run.add_argument("--baseline-required", action=argparse.BooleanOptionalAction,
+                          default=None,
+                          help="refuse a model arm of a human-baselined group until that "
+                               "baseline exists; on by default for such a group")
     open_run.add_argument("--prompt-file", metavar="<path>",
                           help="the prompt as passed; hashed into the manifest, never stored")
     open_run.add_argument("--launch", action="store_true",
                           help="exec the provider's adapter in the worktree instead of printing")
     open_run.set_defaults(handler=cmd_open_run)
+
+    baseline = subcommands.add_parser(
+        "baseline", help="open the human arm of a group, and measure what it did",
+        description="Open a worktree the person works in as themselves — no token, no run "
+                    "environment, hooks that time the commits and stamp them — and, with "
+                    "--close, write what the work took, what the oracle made of it and what it "
+                    "changed.")
+    baseline.add_argument("--repo", metavar="<owner/name|path>",
+                          help="the repository the work is done in")
+    baseline.add_argument("--task", metavar="reg:<id>",
+                          help="the registry entry this baseline measures")
+    baseline.add_argument("--group", metavar="<id>",
+                          help="the paired comparison this is the human arm of")
+    baseline.add_argument("--scope", metavar="<scope>",
+                          help="the scope within the repository, checked against the vocabulary "
+                               "the configuration declares for it")
+    baseline.add_argument("--close", action="store_true",
+                          help="measure the run named by --run and print what a group record "
+                               "carries")
+    baseline.add_argument("--run", metavar="<ULID>", help="the baseline to close")
+    baseline.set_defaults(handler=cmd_baseline)
 
     status = subcommands.add_parser("status", help="list the runs on this machine",
                                     description="Every run directory under the state root, "
