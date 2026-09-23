@@ -1,0 +1,27 @@
+# The unit suite as a check of its own, beside the review that reads its output: the reviewer
+# judges the suite's report, the ruleset requires this job, and the two do not depend on one
+# another — a review that could not run does not make the tests pass, and passing tests do not
+# make a review unnecessary.
+name: tests
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+
+concurrency:
+  group: tests-${{ github.event.pull_request.number }}
+  cancel-in-progress: ${{ !endsWith(github.actor, '[bot]') }}
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: harness tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with: { python-version: '3.14' }
+      - name: Every rule of the harness, as a case that can fail
+        run: python3 -m unittest discover -s tests -p '*_test.py'
