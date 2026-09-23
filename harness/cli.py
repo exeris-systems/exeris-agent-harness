@@ -257,11 +257,17 @@ def _launcher(adapter: str) -> str:
     Named apart from the session loader below because the two are different halves of one adapter
     and take the same argument: one is a path handed to `execve`, the other a module the record is
     assembled from, and a name that answered for both would hand `execve` a module.
+
+    The adapter is found by its entry in the listing of `adapters/` rather than by joining the name
+    it was given onto a path, so the program handed to `execve` is always one this checkout ships.
     """
-    launcher = os.path.join(ROOT, "adapters", adapter, "launch.sh")
-    if not os.path.isfile(launcher):
-        raise Refused(f"no launcher for the {adapter} adapter at {launcher}")
-    return launcher
+    adapters = os.path.join(ROOT, "adapters")
+    for name in sorted(os.listdir(adapters)):
+        if name == adapter:
+            launcher = os.path.join(adapters, name, "launch.sh")
+            if os.path.isfile(launcher):
+                return launcher
+    raise Refused(f"no launcher for the {adapter} adapter under {adapters}")
 
 
 def _provider(cfg, args):
@@ -868,6 +874,20 @@ def _readable(cfg, repo_config) -> list[str]:
     return out
 
 
+def _tree_of(run_dir: str, worktree_path) -> bool:
+    """Whether `worktree_path` is a directory inside `run_dir`, both resolved.
+
+    `open-run` creates a run's tree inside the run's own directory, so a manifest naming a tree
+    anywhere else names one the run does not own, and no pass is driven in it.
+    """
+    if not isinstance(worktree_path, str) or not worktree_path:
+        return False
+    root = os.path.realpath(run_dir)
+    real = os.path.realpath(worktree_path)
+    inside = os.path.commonprefix((real, root)) == root and real.startswith(root + os.sep)
+    return inside and os.path.isdir(real)
+
+
 def cmd_drive(args) -> int:
     """Run the arm headlessly in the run's tree, with the oracle judging after every pass."""
     cfg = config.load()
@@ -881,8 +901,9 @@ def cmd_drive(args) -> int:
     if module is None:
         raise Refused(f"the {adapter} adapter has no headless pass to drive")
     worktree_path = manifest["worktree"]
-    if not os.path.isdir(worktree_path):
-        raise Refused(f"the worktree of {args.run} is gone: {worktree_path}")
+    if not _tree_of(run_dir, worktree_path):
+        raise Refused(f"the worktree of {args.run} is gone, or is not inside its run directory: "
+                      f"{worktree_path}")
 
     run_id = manifest["run_id"]
     repo_config = cfg.repo(manifest["repo"].split("/", 1)[1])
@@ -1479,6 +1500,19 @@ def cmd_flush(args) -> int:
     return EXIT_OK
 
 
+#: How `--run` is spelled in the help, and the grammar it is held to where it is parsed: a ULID in
+#: Crockford's alphabet, the shape `ulid.new` writes and a run directory is named by.
+RUN_METAVAR = "<ULID>"
+_RUN_ID = re.compile(r"[0-9A-HJKMNP-TV-Z]{26}")
+
+
+def _run_id(text: str) -> str:
+    """`--run`, admitted only as a run id: a value of any other shape names no run directory."""
+    if not _RUN_ID.fullmatch(text):
+        raise argparse.ArgumentTypeError(f"{text!r} is not a run id")
+    return text
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
         prog="exeris-agent",
@@ -1540,7 +1574,8 @@ def parser() -> argparse.ArgumentParser:
     baseline.add_argument("--close", action="store_true",
                           help="measure the run named by --run and print what a group record "
                                "carries")
-    baseline.add_argument("--run", metavar="<ULID>", help="the baseline to close")
+    baseline.add_argument("--run", type=_run_id, metavar=RUN_METAVAR,
+                          help="the baseline to close")
     baseline.set_defaults(handler=cmd_baseline)
 
     status = subcommands.add_parser("status", help="list the runs on this machine",
@@ -1554,7 +1589,7 @@ def parser() -> argparse.ArgumentParser:
                     "environment. After each pass the oracle judges the tree; where it says "
                     "FALSE_DONE and rounds remain, the same session is resumed with the failing "
                     "checks, and nothing else, as its prompt.")
-    drive_run.add_argument("--run", required=True, metavar="<ULID>",
+    drive_run.add_argument("--run", required=True, type=_run_id, metavar=RUN_METAVAR,
                            help="the open run to drive; it was opened with --prompt-file")
     drive_run.add_argument("--oracle-rounds", type=int, default=0, metavar="<n>",
                            help="feedback rounds allowed after the first pass; 0, the default, "
@@ -1565,7 +1600,7 @@ def parser() -> argparse.ArgumentParser:
         "close-run", help="push, open the draft pull request, write the run record",
         description="End a run as the execution identity: push its branch, open its draft pull "
                     "request, and stage the run record beside the session stream it references.")
-    close_run.add_argument("--run", required=True, metavar="<ULID>",
+    close_run.add_argument("--run", required=True, type=_run_id, metavar=RUN_METAVAR,
                            help="the run to close")
     close_run.add_argument("--no-pr", action="store_true",
                            help="push, but open no pull request")

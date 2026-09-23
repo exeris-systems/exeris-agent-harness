@@ -37,8 +37,12 @@ from adapters.antigravity import drive as agy_drive  # noqa: E402
 from adapters.antigravity import session as agy_session  # noqa: E402
 from adapters.claude import drive as claude_drive  # noqa: E402
 from adapters.claude import session as claude_session  # noqa: E402
-from harness import drive, oracle, record  # noqa: E402
+from harness import cli, drive, oracle, record  # noqa: E402
 from harness.capture import NoRow  # noqa: E402
+
+#: Session ids as the client writes them.
+SESSION_ONE = "00000000-0000-4000-8000-0000000000c1"
+SESSION_TWO = "00000000-0000-4000-8000-0000000000c2"
 
 CALIBRATED = {"suite": "docs-mutation-v1", "status": "pass", "result": "8/8"}
 
@@ -87,18 +91,17 @@ class DriveFixture(support.HarnessFixture):
 
     # ---- the stand-in client -------------------------------------------------------
 
-    def _pass(self, argv, *, cwd, env, stderr_path):
+    def _pass(self, argv, *, cwd, env, stderr_path, prompt=None):
         number = len(self.passes) + 1
-        self.passes.append({"argv": list(argv), "env": dict(env), "cwd": cwd})
+        self.passes.append({"argv": list(argv), "env": dict(env), "cwd": cwd, "prompt": prompt})
         self.commit(message=f"docs: round {number}", name=f"round-{number}.txt")
         if "antigravity" in argv[0]:
             return self._agy_pass(number, env)
-        prompt = argv[argv.index("-p") + 1]
         if number == 1:
             self.session = self.place_session()
         elif self.writes_feedback:
             self._append_turn(prompt, number)
-        ids = self.session_ids or ["sid-placeholder-1"]
+        ids = self.session_ids or [SESSION_ONE]
         return 0, json.dumps({"type": "result", "session_id": ids[min(number, len(ids)) - 1],
                               "result": "placeholder answer"})
 
@@ -152,14 +155,14 @@ class DriveFixture(support.HarnessFixture):
         self.said, self.printed = said.getvalue(), printed.getvalue()
         return code
 
-    def close(self):
+    def _close(self):
         said, printed = io.StringIO(), io.StringIO()
         with contextlib.redirect_stderr(said), contextlib.redirect_stdout(printed):
             code = self.cli(["close-run", "--run", self.run_id()])
         self.said, self.printed = said.getvalue(), printed.getvalue()
         self.assertEqual(0, code, self.said)
 
-    def record(self):
+    def _record(self):
         return json.loads((self.run_dir() / drive.RECORD).read_text(encoding="utf-8"))
 
 
@@ -172,14 +175,14 @@ class LoopTest(DriveFixture):
         self.assertEqual(0, self.drive(0), self.said)
         self.assertEqual(1, len(self.passes))
         self.assertNotIn("--resume", self.passes[0]["argv"])
-        driven = self.record()
+        driven = self._record()
         self.assertEqual("rounds-exhausted", driven["stopped"])
         self.assertEqual([hashlib.sha256(self.task.read_bytes()).hexdigest()],
                          [entry["prompt_sha256"] for entry in driven["rounds"]])
 
         # A single pass is the single-pass producer: its row sits where an undriven run's does and
         # counts what an undriven run's counts.
-        self.close()
+        self._close()
         row = self.staged_row()
         self.assertEqual(support.FENCE, row["instrument"]["fence"])
         self.assertEqual(2, row["execution"]["human_prompts"])
@@ -190,7 +193,7 @@ class LoopTest(DriveFixture):
         self.open_driven()
         self.assertEqual(0, self.drive(3), self.said)
         self.assertEqual(2, len(self.passes))
-        driven = self.record()
+        driven = self._record()
         self.assertEqual("TRUE_DONE", driven["stopped"])
         self.assertEqual(["FALSE_DONE", "TRUE_DONE"],
                          [entry["outcome"] for entry in driven["rounds"]])
@@ -200,15 +203,50 @@ class LoopTest(DriveFixture):
         self.open_driven()
         self.assertEqual(0, self.drive(1), self.said)
         argv = self.passes[1]["argv"]
-        self.assertEqual("sid-placeholder-1", argv[argv.index("--resume") + 1])
+        self.assertEqual(SESSION_ONE, argv[argv.index("--resume") + 1])
 
     def test_a_client_that_answers_a_resume_with_another_session_is_refused(self):
         self.script = [_judgement("FALSE_DONE")]
-        self.session_ids = ["sid-placeholder-1", "sid-placeholder-2"]
+        self.session_ids = [SESSION_ONE, SESSION_TWO]
         self.open_driven()
         self.assertEqual(2, self.drive(3))
         self.assertEqual(2, len(self.passes))
-        self.assertEqual("session-changed", self.record()["stopped"])
+        self.assertEqual("session-changed", self._record()["stopped"])
+
+    def test_a_session_id_of_another_shape_is_not_resumed(self):
+        self.script = [_judgement("FALSE_DONE")]
+        self.session_ids = ["--settings=/placeholder/elsewhere.json"]
+        self.open_driven()
+        self.assertEqual(2, self.drive(2))
+        self.assertEqual(1, len(self.passes), "a value that is not a session id was resumed")
+        self.assertEqual("resume-unavailable", self._record()["stopped"])
+
+    def test_a_worktree_outside_the_run_directory_is_not_driven(self):
+        self.open_driven()
+        manifest_path = self.run_dir() / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["worktree"] = str(self.tmp)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.assertEqual(2, self.drive(1))
+        self.assertEqual([], self.passes)
+        self.assertIn("not inside its run directory", self.said)
+
+    def test_a_run_that_is_not_a_run_id_is_refused_where_it_is_parsed(self):
+        self.open_driven()
+        for given in ("../" + self.run_id(), self.run_id().lower(), self.run_id() + "0"):
+            with self.subTest(run=given):
+                said = io.StringIO()
+                with contextlib.redirect_stderr(said), contextlib.redirect_stdout(io.StringIO()):
+                    code = self.cli(["drive", "--run", given])
+                self.assertEqual(2, code)
+                self.assertIn("is not a run id", said.getvalue())
+        self.assertEqual([], self.passes)
+
+    def test_the_launcher_is_one_the_checkout_ships(self):
+        self.assertTrue(cli._launcher("claude").endswith("/adapters/claude/launch.sh"))
+        for given in ("../adapters/claude", "claude/../claude", "absent"):
+            with self.subTest(adapter=given), self.assertRaises(cli.Refused):
+                cli._launcher(given)
 
     def test_unknown_stops_the_loop_at_once(self):
         # Once where the oracle could not judge, and once where it judged and its suite has not
@@ -222,14 +260,14 @@ class LoopTest(DriveFixture):
                 self.open_driven()
                 self.assertEqual(0, self.drive(3), self.said)
                 self.assertEqual(1, len(self.passes))
-                self.assertEqual("UNKNOWN", self.record()["stopped"])
+                self.assertEqual("UNKNOWN", self._record()["stopped"])
 
     def test_a_persistent_false_done_exhausts_the_rounds_it_was_allowed(self):
         self.script = [_judgement("FALSE_DONE")]
         self.open_driven()
         self.assertEqual(0, self.drive(2), self.said)
         self.assertEqual(3, len(self.passes))
-        driven = self.record()
+        driven = self._record()
         self.assertEqual("rounds-exhausted", driven["stopped"])
         self.assertEqual([1, 2, 3], [entry["round"] for entry in driven["rounds"]])
 
@@ -265,8 +303,9 @@ class LoopTest(DriveFixture):
         self.assertEqual(claude_drive.ALLOWED_TOOLS, argv[argv.index("--allowedTools") + 1])
         self.assertEqual("acceptEdits", argv[argv.index("--permission-mode") + 1])
         self.assertEqual("json", argv[argv.index("--output-format") + 1])
-        # The task, straight after `-p`, as the file holds it.
-        self.assertEqual(self.task.read_text(), argv[argv.index("-p") + 1])
+        # The task, on standard input as the file holds it, and nowhere on the command line.
+        self.assertEqual(self.task.read_text(), made["prompt"])
+        self.assertNotIn(self.task.read_text(), argv)
         self.assertEqual(str(self.worktree()), made["cwd"])
         # The run's token reaches the pass through its environment and never its command line.
         self.assertEqual(support.FAKE_TOKEN, made["env"]["GH_TOKEN"])
@@ -304,10 +343,10 @@ class FeedbackTest(DriveFixture):
         self.script = [_judgement("FALSE_DONE"), _judgement("TRUE_DONE")]
         self.open_driven()
         self.assertEqual(0, self.drive(1), self.said)
-        argv = self.passes[1]["argv"]
-        self.assertEqual(expected, argv[argv.index("-p") + 1])
+        self.assertEqual(expected, self.passes[1]["prompt"])
+        self.assertNotIn(expected, self.passes[1]["argv"])
         # Kept beside the run, because it is instrument output and not the task.
-        driven = self.record()
+        driven = self._record()
         self.assertEqual(hashlib.sha256(expected.encode("utf-8")).hexdigest(),
                          driven["rounds"][1]["prompt_sha256"])
         self.assertEqual(expected, (self.run_dir() / drive.DIRECTORY / "round-2.prompt")
@@ -320,7 +359,7 @@ class FeedbackTest(DriveFixture):
         self.open_driven()
         self.assertEqual(2, self.drive(2))
         self.assertEqual(1, len(self.passes))
-        self.assertEqual("no-failing-gate", self.record()["stopped"])
+        self.assertEqual("no-failing-gate", self._record()["stopped"])
 
 
 class DrivenRowTest(DriveFixture):
@@ -331,7 +370,7 @@ class DrivenRowTest(DriveFixture):
                        _judgement("TRUE_DONE")]
         self.open_driven()
         self.assertEqual(0, self.drive(support.ORACLE_ROUNDS), self.said)
-        self.close()
+        self._close()
 
     def test_the_oracle_s_prompts_are_not_a_person_s_and_a_person_s_still_are(self):
         self._driven_and_closed()
@@ -367,7 +406,7 @@ class DrivenRowTest(DriveFixture):
     def test_a_drive_record_that_cannot_be_read_yields_no_row(self):
         self._driven_and_closed_without_closing()
         (self.run_dir() / drive.RECORD).write_text("not json", encoding="utf-8")
-        self.close()
+        self._close()
         self.assertEqual([], self.staged_rows())
         self.assertIn("drive-record-unreadable", self.said)
 
@@ -400,14 +439,76 @@ class AntigravityDriveTest(DriveFixture):
             self.passes[1]["env"]["EXERIS_PROMPT_FILE"]).read_text(encoding="utf-8"))
         self.assertEqual(str(self.task), self.passes[0]["env"]["EXERIS_PROMPT_FILE"])
 
+    def test_a_conversation_id_of_another_shape_is_not_continued(self):
+        self.conversation = "placeholder conversation"
+        self.script = [_judgement("FALSE_DONE")]
+        self.open_driven()
+        self.assertEqual(2, self.drive(2))
+        self.assertEqual(1, len(self.passes))
+        self.assertEqual("resume-unavailable", self._record()["stopped"])
+
+    def test_the_prompt_reaches_the_launcher_by_file_and_standard_input_is_closed(self):
+        self.script = [_judgement("TRUE_DONE")]
+        self.open_driven()
+        self.assertEqual(0, self.drive(0), self.said)
+        self.assertIsNone(self.passes[0]["prompt"])
+        self.assertNotIn(self.task.read_text(), self.passes[0]["argv"])
+
     def test_a_stream_that_names_no_conversation_refuses_the_loop(self):
         self.conversation = None
         self.script = [_judgement("FALSE_DONE")]
         self.open_driven()
         self.assertEqual(2, self.drive(2))
         self.assertEqual(1, len(self.passes), "a new session was started in place of a resume")
-        self.assertEqual("resume-unavailable", self.record()["stopped"])
+        self.assertEqual("resume-unavailable", self._record()["stopped"])
         self.assertIn("no session to resume", self.said)
+
+
+class PassTest(unittest.TestCase):
+    """One pass, started for real on a stand-in program: what reaches it, and what does not."""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="exeris-drive-pass-test-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
+        self.stderr = str(self.tmp / "round-1.stderr")
+
+    def _echo(self, prompt):
+        argv = [sys.executable, "-c", "import sys; sys.stdout.write(sys.stdin.read())"]
+        return drive.run_pass(argv, cwd=str(self.tmp), env={}, stderr_path=self.stderr,
+                              prompt=prompt)
+
+    def test_the_prompt_is_the_pass_s_standard_input_byte_for_byte(self):
+        text = "placeholder: a prompt\nof two lines, 'quoted' and $(not run)\n"
+        self.assertEqual((0, text), self._echo(text))
+
+    def test_without_a_prompt_standard_input_is_closed(self):
+        self.assertEqual((0, ""), self._echo(None))
+
+    def test_a_command_line_word_with_a_control_character_is_not_started(self):
+        marker = self.tmp / "started"
+        for word in ("placeholder\nword", "placeholder\x00word", ""):
+            with self.subTest(word=word):
+                argv = [sys.executable, "-c", f"open({str(marker)!r}, 'w')", word]
+                self.assertEqual((127, ""), drive.run_pass(argv, cwd=str(self.tmp), env={},
+                                                           stderr_path=self.stderr))
+                self.assertFalse(marker.exists())
+                self.assertIn("was not started", pathlib.Path(self.stderr).read_text())
+
+    def test_an_adapter_puts_no_resume_of_another_shape_on_a_command_line(self):
+        for module in (claude_drive, agy_drive):
+            with self.subTest(adapter=module.__name__), self.assertRaises(ValueError):
+                module.arguments(readable=[], resume="--settings=/placeholder/elsewhere.json")
+        self.assertEqual(["-p", "--output-format", "json", "--permission-mode", "acceptEdits",
+                          "--allowedTools", claude_drive.ALLOWED_TOOLS, "--resume", SESSION_ONE],
+                         claude_drive.arguments(readable=[], resume=SESSION_ONE))
+
+    def test_the_claude_answer_yields_a_session_only_of_the_session_id_s_shape(self):
+        answer = lambda named: drive.Answer(  # noqa: E731
+            stdout=json.dumps({"session_id": named}), run_dir=str(self.tmp))
+        self.assertEqual(SESSION_ONE, claude_drive.resume_id(answer(SESSION_ONE)))
+        for named in ("sid-placeholder-1", SESSION_ONE + " --x", "", 7):
+            with self.subTest(named=named):
+                self.assertIsNone(claude_drive.resume_id(answer(named)))
 
 
 class FenceTest(unittest.TestCase):
@@ -490,22 +591,23 @@ class ReaderTest(unittest.TestCase):
         self.assertIsNone(facts["wall_time_ms"])
 
     def test_more_oracle_rounds_than_resumed_invocations_is_refused(self):
+        stream = self._agy(self._resumed())
         with self.assertRaises(NoRow) as refusal:
-            agy_session.read(self._agy(self._resumed()), oracle_prompts=["0" * 64, "1" * 64])
+            agy_session.read(stream, oracle_prompts=["0" * 64, "1" * 64])
         self.assertEqual("oracle-prompt-unmatched", refusal.exception.reason)
 
     def test_two_conversations_in_one_stream_are_two_sessions(self):
-        entries = self._resumed(conversation="00000000-0000-4000-8000-00000000000b")
+        stream = self._agy(self._resumed(conversation="00000000-0000-4000-8000-00000000000b"))
         with self.assertRaises(NoRow) as refusal:
-            agy_session.read(self._agy(entries))
+            agy_session.read(stream)
         self.assertEqual("multiple-sessions", refusal.exception.reason)
 
     def test_the_conversation_to_resume_is_the_one_the_latest_init_names(self):
         self._agy(self._resumed())
         self.assertEqual("00000000-0000-4000-8000-00000000000a",
-                         agy_drive.resume_id(stdout="", run_dir=str(self.tmp)))
+                         agy_drive.resume_id(drive.Answer(stdout="", run_dir=str(self.tmp))))
         self._agy([{"event": "init", "init": {"model": support.AGY_MODEL}}])
-        self.assertIsNone(agy_drive.resume_id(stdout="", run_dir=str(self.tmp)))
+        self.assertIsNone(agy_drive.resume_id(drive.Answer(stdout="", run_dir=str(self.tmp))))
 
 
 if __name__ == "__main__":

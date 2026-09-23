@@ -174,6 +174,154 @@ def _usage(reported) -> dict:
     return out
 
 
+def _entries(raw: bytes):
+    """Every line of the stream that parses as a JSON object, in order.
+
+    A line that does not parse, or parses as something else, is not an event. The count of what is
+    yielded is `event_count`: what keeps the row summarisable once a retention window has taken the
+    stream itself away.
+    """
+    for line in raw.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(entry, dict):
+            yield entry
+
+
+class _Tally:
+    """What `read` accumulates over one stream, one event at a time."""
+
+    def __init__(self):
+        self.event_count = 0
+        self.models: set[str] = set()
+        self.steps: dict[object, str] = {}
+        self.states: dict[object, set[str]] = {}
+        self.result = None
+        self.results = 0
+        self.invocation = 0
+        self.opened_by: dict[object, int] = {}
+        self.conversations: set[str] = set()
+
+    def add(self, entry: dict) -> None:
+        self.event_count += 1
+        event = entry.get("event")
+        named = entry.get("conversation_id")
+        if isinstance(named, str) and named:
+            self.conversations.add(named)
+        if event == "init":
+            self._init(entry)
+        elif event == "step_update":
+            self._step(entry.get("step_update") or {})
+        elif event == "result" and isinstance(entry.get("result"), dict):
+            self.result = entry["result"]
+            self.results += 1
+
+    def _init(self, entry: dict) -> None:
+        self.invocation += 1
+        model = (entry.get("init") or {}).get("model")
+        if _is_model(model):
+            self.models.add(model)
+
+    def _step(self, step: dict) -> None:
+        index = step.get("step_index")
+        if index is None:
+            return
+        kind = step.get("step_type")
+        if isinstance(kind, str) and kind:
+            self.steps[index] = kind
+            if kind == PROMPT_STEP:
+                self.opened_by.setdefault(index, self.invocation)
+        elif index not in self.steps:
+            self.steps[index] = ""
+        state = step.get("state")
+        if isinstance(state, str) and state:
+            self.states.setdefault(index, set()).add(state)
+
+    def closing(self, path: str) -> dict:
+        """The closing event the totals are read from, or `NoRow` where the stream is not one
+        session this adapter can count."""
+        if not self.models:
+            raise NoRow("model-absent", path)
+        if len(self.models) > 1:
+            # Two models named in one stream is two sessions in one file. `agent.model_id` is
+            # singular and names the model that took the turns, so neither of them is this run's.
+            raise NoRow("multi-model", ", ".join(sorted(self.models)))
+        if len(self.conversations) > 1:
+            raise NoRow("multiple-sessions", ", ".join(sorted(self.conversations)))
+        if self.result is None:
+            # The totals — turns, tokens, wall time — are all the closing event's. A stream without
+            # one is a session this adapter cannot count, whatever else it holds.
+            raise NoRow("session-unreadable", f"{path} carries no result event")
+        return self.result
+
+    def notes(self) -> list[str]:
+        """The step types and states the stream used, as they are printed beside the run."""
+        kinds: dict[str, int] = {}
+        for kind in self.steps.values():
+            kinds[kind or "<unnamed>"] = kinds.get(kind or "<unnamed>", 0) + 1
+        return [
+            "step types: " + ", ".join(f"{name}={count}" for name, count in sorted(kinds.items())),
+            "step states: " + (", ".join(sorted({state for seen in self.states.values()
+                                                 for state in seen})) or "none"),
+        ]
+
+    def prompts(self, path: str, notes: list[str]) -> int:
+        """How many prompt steps the stream holds, or `NoRow` where it spells none.
+
+        The assumption both counts rest on, checked here rather than carried into them. Under a
+        client that spells its prompt step some other way, every prompt is counted as a tool call
+        and the steering count reads `0` — a positive claim that nobody steered the run, made out of
+        a name nobody measured. The names the stream did use go to the person here, because a
+        refusal takes the notes out of the harness's hands and they are the whole of what makes this
+        one answerable: a first run under an unknown client says which vocabulary it speaks.
+        """
+        prompts = sum(1 for kind in self.steps.values() if kind == PROMPT_STEP)
+        if not prompts:
+            for note in notes:
+                print(f"exeris-agent: {path}: {note}", file=sys.stderr)
+            raise NoRow("session-unreadable",
+                        f"{path} names no {PROMPT_STEP} step, so its tool steps cannot be told "
+                        f"from its prompts")
+        return prompts
+
+    def check_oracle_rounds(self, path: str, recorded: int) -> None:
+        """`NoRow` where the loop recorded more feedback rounds than the stream can hold.
+
+        The invocations after the first that opened with a prompt: each is a place a feedback round
+        could have been sent, and there have to be at least as many as the loop recorded sending.
+        """
+        resumed = len({number for number in self.opened_by.values() if number > 1})
+        if recorded > resumed:
+            raise NoRow("oracle-prompt-unmatched",
+                        f"the oracle loop recorded {recorded} feedback round(s) and {path} "
+                        f"holds {resumed} resumed invocation(s) that opened with a prompt")
+
+    def tool_calls(self) -> int:
+        return sum(1 for kind in self.steps.values() if kind and kind not in CONVERSATION)
+
+    def denials(self) -> int:
+        """Steps whose state names a refusal.
+
+        Where no state in the stream names one, the caller states the count as absent rather than
+        zero: this client's state vocabulary is unmeasured, and a run nothing refused must not read
+        the same as a run whose refusals nobody could see.
+        """
+        return sum(1 for seen in self.states.values()
+                   if any(_DENIAL.search(state) for state in seen))
+
+    def wall_time_ms(self, result: dict) -> int | None:
+        """The closing event's duration, where exactly one closing event was written."""
+        seconds = result.get("duration_seconds")
+        if self.results != 1 or not isinstance(seconds, (int, float)) or isinstance(seconds, bool):
+            return None
+        return max(int(round(float(seconds) * 1000)), 0)
+
+
 def read(path: str, *, oracle_prompts=()) -> dict:
     """Everything the row needs from one stream, in counts and digests.
 
@@ -190,70 +338,10 @@ def read(path: str, *, oracle_prompts=()) -> dict:
     except OSError as exc:
         raise NoRow("session-unreadable", str(exc)) from None
 
-    event_count = 0
-    models: set[str] = set()
-    steps: dict[object, str] = {}
-    states: dict[object, set[str]] = {}
-    result = None
-    results = 0
-    invocation = 0
-    opened_by: dict[object, int] = {}
-    conversations: set[str] = set()
-
-    for line in raw.decode("utf-8", "replace").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entry = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if not isinstance(entry, dict):
-            continue
-        # Every line the stream holds and this module could parse. It is what keeps the row
-        # summarisable once a retention window has taken the stream itself away.
-        event_count += 1
-
-        event = entry.get("event")
-        named = entry.get("conversation_id")
-        if isinstance(named, str) and named:
-            conversations.add(named)
-        if event == "init":
-            invocation += 1
-            model = (entry.get("init") or {}).get("model")
-            if _is_model(model):
-                models.add(model)
-        elif event == "step_update":
-            step = entry.get("step_update") or {}
-            index = step.get("step_index")
-            if index is None:
-                continue
-            kind = step.get("step_type")
-            if isinstance(kind, str) and kind:
-                steps[index] = kind
-                if kind == PROMPT_STEP:
-                    opened_by.setdefault(index, invocation)
-            elif index not in steps:
-                steps[index] = ""
-            state = step.get("state")
-            if isinstance(state, str) and state:
-                states.setdefault(index, set()).add(state)
-        elif event == "result" and isinstance(entry.get("result"), dict):
-            result = entry["result"]
-            results += 1
-
-    if not models:
-        raise NoRow("model-absent", path)
-    if len(models) > 1:
-        # Two models named in one stream is two sessions in one file. `agent.model_id` is singular
-        # and names the model that took the turns, so neither of them is this run's.
-        raise NoRow("multi-model", ", ".join(sorted(models)))
-    if len(conversations) > 1:
-        raise NoRow("multiple-sessions", ", ".join(sorted(conversations)))
-    if result is None:
-        # The totals — turns, tokens, wall time — are all the closing event's. A stream without one
-        # is a session this adapter cannot count, whatever else it holds.
-        raise NoRow("session-unreadable", f"{path} carries no result event")
+    tally = _Tally()
+    for entry in _entries(raw):
+        tally.add(entry)
+    result = tally.closing(path)
 
     client_version = version(os.path.dirname(os.path.abspath(path)))
     if not client_version:
@@ -263,68 +351,28 @@ def read(path: str, *, oracle_prompts=()) -> dict:
     if turns is None:
         raise NoRow("session-unreadable", f"{path} reports no turn count")
 
-    kinds: dict[str, int] = {}
-    for kind in steps.values():
-        kinds[kind or "<unnamed>"] = kinds.get(kind or "<unnamed>", 0) + 1
-    notes = [
-        "step types: " + ", ".join(f"{name}={count}" for name, count in sorted(kinds.items())),
-        "step states: " + (", ".join(sorted({state for seen in states.values()
-                                             for state in seen})) or "none"),
-    ]
-
-    # The assumption both counts rest on, checked here rather than carried into them. Under a
-    # client that spells its prompt step some other way, every prompt is counted as a tool call and
-    # the steering count reads `0` — a positive claim that nobody steered the run, made out of a
-    # name nobody measured. The names the stream did use go to the person here, because a refusal
-    # takes the notes below out of the harness's hands and they are the whole of what makes this
-    # one answerable: a first run under an unknown client says which vocabulary it speaks.
-    if not any(kind == PROMPT_STEP for kind in steps.values()):
-        for note in notes:
-            print(f"exeris-agent: {path}: {note}", file=sys.stderr)
-        raise NoRow("session-unreadable",
-                    f"{path} names no {PROMPT_STEP} step, so its tool steps cannot be told from "
-                    f"its prompts")
-
-    prompts = sum(1 for kind in steps.values() if kind == PROMPT_STEP)
-    # The invocations after the first that opened with a prompt: each is a place a feedback round
-    # could have been sent, and there have to be at least as many as the loop recorded sending.
-    resumed = len({number for number in opened_by.values() if number > 1})
-    if len(oracle_prompts) > resumed:
-        raise NoRow("oracle-prompt-unmatched",
-                    f"the oracle loop recorded {len(oracle_prompts)} feedback round(s) and {path} "
-                    f"holds {resumed} resumed invocation(s) that opened with a prompt")
-    tool_calls = sum(1 for kind in steps.values() if kind and kind not in CONVERSATION)
-
-    # A step whose state names a refusal, counted. Where no state in the stream names one, the
-    # count is not zero but absent: this client's state vocabulary is unmeasured, and a run nothing
-    # refused must not read the same as a run whose refusals nobody could see.
-    denials = sum(1 for seen in states.values() if any(_DENIAL.search(state) for state in seen))
-
-    seconds = result.get("duration_seconds")
-    wall_time_ms = (max(int(round(float(seconds) * 1000)), 0)
-                    if isinstance(seconds, (int, float)) and not isinstance(seconds, bool)
-                    and results == 1 else None)
+    notes = tally.notes()
+    prompts = tally.prompts(path, notes)
+    tally.check_oracle_rounds(path, len(oracle_prompts))
+    denials = tally.denials()
 
     return {
         "path": path,
         "sha256": hashlib.sha256(raw).hexdigest(),
-        "event_count": event_count,
-        "model_id": sorted(models)[0],
+        "event_count": tally.event_count,
+        "model_id": sorted(tally.models)[0],
         "client": CLIENT,
         "version": client_version,
         # The client's own count of the turns it took, rather than a count of the steps it wrote:
         # a turn and a step are not the same unit, and the client is the one that knows its own.
         "turns": turns,
-        "tool_calls": tool_calls,
+        "tool_calls": tally.tool_calls(),
         "usage": _usage(result.get("usage")),
-        "wall_time_ms": wall_time_ms,
+        "wall_time_ms": tally.wall_time_ms(result),
         # The first prompt is what started the run; what is counted here is steering, which is why
-        # a run asked once and left to finish is `0` rather than `1`. With no prompt in the stream
-        # there is no count to take, and the row carries none: this adapter's rule throughout is
-        # that what the stream does not carry is absent, and a `0` there would be the one shape of
-        # the rule that reads as a measurement.
-        # The oracle's prompts are the instrument's and are not steering.
-        "human_prompts": max(prompts - 1 - len(oracle_prompts), 0) if prompts else None,
+        # a run asked once and left to finish is `0` rather than `1`. The oracle's prompts are the
+        # instrument's and are not steering.
+        "human_prompts": max(prompts - 1 - len(oracle_prompts), 0),
         "permission_denials": denials or None,
         # The stream carries no prompt text. The digest of what instructed the run comes from the
         # file the harness passed the client, which is why this adapter cannot be run without one.
