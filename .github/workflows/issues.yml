@@ -1,0 +1,37 @@
+# Copy to <repo>/.github/workflows/issues.yml alongside guardrails.yml — the issue-side footprint of
+# issue-conventions.md rules 3 and 5.
+#
+# Separate from guardrails.yml because it is not pull-request-triggered and needs `issues: write`,
+# which the pull-request gates deliberately do not have.
+name: issues
+on:
+  # On this file itself, so adopting it syncs the taxonomy from the same merge instead of leaving
+  # every label uncreated until someone dispatches this by hand. A label the publication applies
+  # before it exists is created implicitly by the issues API, in whatever colour it chooses — the
+  # taxonomy bypassed in the act of using it.
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/issues.yml
+  schedule:
+    - cron: "17 4 * * 1"     # Monday, early. Label drift and stale evidence are not urgent.
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Report label changes without making them"
+        type: boolean
+        default: false
+permissions:
+  issues: write
+
+jobs:
+  labels:
+    uses: exeris-systems/.github/.github/workflows/labels-sync.yml@main
+    with:
+      dry-run: ${{ inputs.dry-run == true }}
+  hygiene:
+    # Not on a taxonomy push. This job closes issues that have gone quiet, and a label
+    # definition changing is no reason to age one out — the weekly run is when that
+    # judgement belongs.
+    if: ${{ github.event_name != 'push' }}
+    uses: exeris-systems/.github/.github/workflows/issue-hygiene.yml@main

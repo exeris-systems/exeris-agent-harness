@@ -1,0 +1,36 @@
+# The unit suite as a check of its own, beside the review that reads its output: the reviewer
+# judges the suite's report, the ruleset requires this job, and the two do not depend on one
+# another — a review that could not run does not make the tests pass, and passing tests do not
+# make a review unnecessary.
+name: tests
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+
+concurrency:
+  group: tests-${{ github.event.pull_request.number }}
+  cancel-in-progress: ${{ !endsWith(github.actor, '[bot]') }}
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: harness tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The row contract the suite writes rows against lives in the execution repository and is
+      # read from a checkout of it, never copied here; without it the cases that need a schema
+      # skip, and a suite that skipped its rows is not the suite this check is named for.
+      - uses: actions/checkout@v7
+        with: { repository: exeris-systems/exeris-ai-execution, path: _execution }
+      - uses: actions/setup-python@v7
+        with: { python-version: '3.14' }
+      - name: Every rule of the harness, as a case that can fail
+        env:
+          EXERIS_EXECUTION_REPO: ${{ github.workspace }}/_execution
+        run: |
+          python3 -m unittest discover -s tests -p '*_test.py' 2>&1 | tee suite.out
+          ! grep -q "skipped=" suite.out
