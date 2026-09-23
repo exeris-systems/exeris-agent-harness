@@ -12,6 +12,12 @@ deliberately not installed there. A person opening that pull request is a sign-o
 rows, not a fallback credential for the runs it describes — so everything a run bound to the shell
 is taken out of the environment first, and a shell still bound to one is refused.
 
+`drive` sits between the first two where nobody sits at the run: it launches the arm headless in
+the run's tree under the run's own environment, and asks the oracle about the tree after every pass,
+resuming the same session with the failing checks for as many rounds as it was allowed. It is a
+command of its own rather than a flag on `open-run`, because `open-run --launch` hands the process
+to the client for a person to work in, and a loop has to outlive the pass it launched.
+
 Between them sits a rule neither command breaks: a value the run could not establish is not
 defaulted. `close-run` pushes and opens the pull request either way, and where the record cannot be
 assembled it writes no row and names the reason, which is counted rather than repaired.
@@ -24,12 +30,13 @@ import importlib
 import json
 import os
 import re
+import shlex
 import shutil
 import sys
 import tempfile
 
-from . import (ROOT, VERSION, capture, config, oracle, providers, record, runstate, token, ulid,
-               worktree)
+from . import (ROOT, VERSION, capture, config, drive, oracle, providers, record, runstate, token,
+               ulid, worktree)
 # Bound here rather than used through the module, because this name is the seam: everything that
 # reaches git or the forge is constructed from it, so substituting it substitutes both halves at
 # once and a test can replace the forge while keeping git.
@@ -250,11 +257,17 @@ def _launcher(adapter: str) -> str:
     Named apart from the session loader below because the two are different halves of one adapter
     and take the same argument: one is a path handed to `execve`, the other a module the record is
     assembled from, and a name that answered for both would hand `execve` a module.
+
+    The adapter is found by its entry in the listing of `adapters/` rather than by joining the name
+    it was given onto a path, so the program handed to `execve` is always one this checkout ships.
     """
-    launcher = os.path.join(ROOT, "adapters", adapter, "launch.sh")
-    if not os.path.isfile(launcher):
-        raise Refused(f"no launcher for the {adapter} adapter at {launcher}")
-    return launcher
+    adapters = os.path.join(ROOT, "adapters")
+    for name in sorted(os.listdir(adapters)):
+        if name == adapter:
+            launcher = os.path.join(adapters, name, "launch.sh")
+            if os.path.isfile(launcher):
+                return launcher
+    raise Refused(f"no launcher for the {adapter} adapter under {adapters}")
 
 
 def _provider(cfg, args):
@@ -558,7 +571,7 @@ def _title(net, worktree_path: str, commits: list, run_id: str) -> str:
 
 
 def _row(args, cfg, net, manifest, *, worktree_path, visibility, dirty, commits,
-         ended_at, judgement) -> tuple[dict | None, str | None, str | None]:
+         ended_at, judgement, driven) -> tuple[dict | None, str | None, str | None]:
     """`(row, session path, reason)` — the run record, or why there is not one.
 
     Every refusal reaches here as `NoRow` and leaves as a reason, because a run that cannot be
@@ -577,7 +590,13 @@ def _row(args, cfg, net, manifest, *, worktree_path, visibility, dirty, commits,
         if not isinstance(session, str):
             named = session[1] if isinstance(session, (tuple, list)) and len(session) > 1 else None
             raise capture.NoRow(named or "adapter-identity-only")
-        facts = module.read(session)
+        # A driven run's session holds prompts the oracle loop wrote. They are named to the reader
+        # by digest so that the steering count is a person's; a run nobody drove names none, and
+        # its reader is asked exactly as it always was.
+        if isinstance(driven, capture.NoRow):
+            raise driven
+        sent = drive.oracle_prompts(driven)
+        facts = module.read(session, oracle_prompts=sent) if sent else module.read(session)
         # What the adapter measured but the row has no field for. It is printed beside the run and
         # written nowhere: a shape nobody has measured is learned from a run that had one, and a
         # count whose meaning is unchecked does not belong in a column.
@@ -621,7 +640,8 @@ def _row(args, cfg, net, manifest, *, worktree_path, visibility, dirty, commits,
             # to them are not one population.
             fence=record.fence(cfg.execution_repo_path or "", adapter,
                                arm.get("harness_version") or facts["version"],
-                               arm.get("model_snapshot")),
+                               arm.get("model_snapshot"),
+                               oracle_rounds=drive.oracle_rounds(driven)),
             ref=record.stream_ref(cfg.org, os.path.basename(cfg.streams_repo_path or ""), date,
                                   manifest["repo"].split("/", 1)[1], manifest["run_id"]),
             # The prompt as it was passed, where the run was given one, and otherwise the prompt
@@ -713,15 +733,21 @@ def cmd_close_run(args) -> int:
         pull_request = (answer or {}).get("html_url") if isinstance(answer, dict) else None
 
     visibility = _visibility(net, repo, environment)
+    try:
+        driven = drive.read_record(run_dir)
+    except capture.NoRow as refusal:
+        driven = refusal
     row, session, reason = _row(args, cfg, net, manifest, worktree_path=worktree_path,
                                 visibility=visibility, dirty=dirty, commits=commits,
-                                ended_at=ended_at, judgement=judgement)
+                                ended_at=ended_at, judgement=judgement, driven=driven)
 
     date = record.date_of(manifest["started_at"])
     os.makedirs(staging, mode=runstate.DIR_MODE, exist_ok=True)
     # Staged whether or not there is a row. A run the record could not be assembled for was judged
     # all the same, and the gates are the one account of it that survives.
     _stage_judgement(run_dir, judgement, run_id=run_id, domain=domain)
+    if isinstance(driven, dict):
+        _stage_drive(run_dir, driven, run_id)
     if row is not None:
         # The stream is copied rather than referenced: the client's own log is the person's and may
         # be rotated or removed, and the row's digest has to keep naming something that exists.
@@ -748,6 +774,157 @@ def cmd_close_run(args) -> int:
         print(pull_request)
     if args.remove_worktree:
         _remove_worktree(net, worktree_path, dirty)
+    return EXIT_OK
+
+
+def _stage_drive(run_dir: str, driven: dict, run_id: str) -> None:
+    """The rounds a driven run used, staged beside its row and printed.
+
+    The row has no field for them and is given none; this file is where a reader of the row finds
+    how many of the allowed rounds the run took.
+    """
+    staged = drive.summary(driven, run_id)
+    runstate.write_text(run_dir, os.path.join("staging", drive.RECORD),
+                        json.dumps(staged, indent=2, sort_keys=True) + "\n")
+    print(f"exeris-agent: {run_id} was driven in {staged['passes']} pass(es), "
+          f"{staged['feedback_rounds']} of at most {staged['oracle_rounds']} oracle round(s); "
+          f"stopped: {staged['stopped']}")
+
+
+def _drive_module(adapter: str):
+    """The adapter's drive half, or nothing where the adapter has no headless pass."""
+    try:
+        return importlib.import_module(f"adapters.{adapter}.drive")
+    except ImportError:
+        return None
+
+
+def _open_model_run(run: str) -> tuple[str, dict]:
+    """The directory and manifest of a model arm that is open, or `Refused`."""
+    if not ulid.is_ulid(run):
+        raise Refused(f"--run {run!r} is not a run id")
+    run_dir = runstate.path(run)
+    manifest = runstate.read_manifest(run_dir)
+    if manifest is None:
+        raise Refused(f"no run {run} under {runstate.runs_root()}")
+    if manifest.get("kind") == BASELINE_KIND:
+        raise Refused(f"{run} is a human baseline; nobody but the person works in it")
+    if not manifest.get("provider_table"):
+        raise Refused(f"the manifest of {run} names no provider table, so no adapter can drive it")
+    if os.path.exists(os.path.join(run_dir, "staging", CLOSED)):
+        raise Refused(f"{run} was closed already; a closed run is not driven")
+    return run_dir, manifest
+
+
+def _launch_environment(run_dir: str, run_id: str) -> dict:
+    """The environment `open-run` wrote for the run, read back from the file it wrote.
+
+    Read from the file rather than rebuilt, because the file is what a person sourcing it gets and
+    carries the arm's own variables beside the run's; a drive that rebuilt it from the provider
+    table as it stands now would launch under a table edited since the run opened. What the file
+    unsets is dropped from the inherited environment first, as sourcing it would.
+    """
+    try:
+        with open(os.path.join(run_dir, "env"), encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except OSError as exc:
+        raise Refused(f"run {run_id} has no environment to drive it in: {exc}") from None
+    environment = {key: value for key, value in os.environ.items() if key not in runstate.UNSET}
+    for line in lines:
+        words = shlex.split(line, comments=True)
+        if len(words) == 2 and words[0] == "export" and "=" in words[1]:
+            key, value = words[1].split("=", 1)
+            environment[key] = value
+    if not environment.get("GH_TOKEN"):
+        raise Refused(f"run {run_id} has no token in its environment; it cannot act as the "
+                      f"identity")
+    return environment
+
+
+def _task(environment: dict, manifest: dict) -> tuple[str, str]:
+    """`(path, text)` of the task the run was opened with, checked against the manifest's digest.
+
+    A task file edited since the run opened would be a different task under the same digest on the
+    row, so it is refused rather than sent.
+    """
+    path = environment.get("EXERIS_PROMPT_FILE")
+    if not path or not manifest.get("prompt_sha256"):
+        raise Refused(f"run {manifest['run_id']} was opened without --prompt-file; a pass nobody "
+                      f"sits at has no other way to be given its task")
+    try:
+        with open(path, "rb") as handle:
+            body = handle.read()
+    except OSError as exc:
+        raise Refused(f"the task file {path}: {exc}") from None
+    if hashlib.sha256(body).hexdigest() != manifest["prompt_sha256"]:
+        raise Refused(f"the task file {path} is not the one run {manifest['run_id']} was opened "
+                      f"with: its digest has changed")
+    return path, body.decode("utf-8")
+
+
+def _readable(cfg, repo_config) -> list[str]:
+    """The repository's readable directories, absolute, each one there."""
+    out = []
+    for entry in repo_config.readable:
+        directory = cfg.beside(entry)
+        if not os.path.isdir(directory):
+            raise Refused(f"[repos.{repo_config.name}].readable names {directory}, which is not a "
+                          f"directory; a pass would be allowed less than the configuration says")
+        out.append(directory)
+    return out
+
+
+def _tree_of(run_dir: str, worktree_path) -> bool:
+    """Whether `worktree_path` is a directory inside `run_dir`, both resolved.
+
+    `open-run` creates a run's tree inside the run's own directory, so a manifest naming a tree
+    anywhere else names one the run does not own, and no pass is driven in it.
+    """
+    if not isinstance(worktree_path, str) or not worktree_path:
+        return False
+    root = os.path.realpath(run_dir)
+    real = os.path.realpath(worktree_path)
+    inside = os.path.commonprefix((real, root)) == root and real.startswith(root + os.sep)
+    return inside and os.path.isdir(real)
+
+
+def cmd_drive(args) -> int:
+    """Run the arm headlessly in the run's tree, with the oracle judging after every pass."""
+    cfg = config.load()
+    run_dir, manifest = _open_model_run(args.run)
+    if args.oracle_rounds < 0:
+        raise Refused(f"--oracle-rounds {args.oracle_rounds} is not a number of rounds")
+    if os.path.exists(os.path.join(run_dir, drive.RECORD)):
+        raise Refused(f"{args.run} was driven already; a second drive would be a second session")
+    adapter = manifest["provider_table"].get("adapter") or manifest["provider"]
+    module = _drive_module(adapter)
+    if module is None:
+        raise Refused(f"the {adapter} adapter has no headless pass to drive")
+    worktree_path = manifest["worktree"]
+    if not _tree_of(run_dir, worktree_path):
+        raise Refused(f"the worktree of {args.run} is gone, or is not inside its run directory: "
+                      f"{worktree_path}")
+
+    run_id = manifest["run_id"]
+    repo_config = cfg.repo(manifest["repo"].split("/", 1)[1])
+    readable = _readable(cfg, repo_config)
+    environment = _launch_environment(run_dir, run_id)
+    task_file, task_text = _task(environment, manifest)
+    launcher = _launcher(adapter)
+
+    driven = drive.loop(adapter=adapter, module=module, launcher=launcher, run_dir=run_dir,
+                        worktree=worktree_path, environment=environment, task_text=task_text,
+                        task_file=task_file, task_sha256=manifest["prompt_sha256"],
+                        readable=readable, max_rounds=args.oracle_rounds,
+                        judge=lambda: _judged(cfg, worktree_path, repo_config.domain, run_id))
+    for entry in driven["rounds"]:
+        print(f"exeris-agent: {run_id} round {entry['round']}: {entry['outcome']} "
+              f"({entry['wall_time_ms']} ms, exit {entry['exit']})")
+    refused = drive.refusal(driven)
+    if refused:
+        raise Refused(f"{run_id}: {refused}")
+    print(f"exeris-agent: {run_id} stopped: {driven['stopped']}; close it with "
+          f"`exeris-agent close-run --run {run_id}`")
     return EXIT_OK
 
 
@@ -1323,6 +1500,19 @@ def cmd_flush(args) -> int:
     return EXIT_OK
 
 
+#: How `--run` is spelled in the help, and the grammar it is held to where it is parsed: a ULID in
+#: Crockford's alphabet, the shape `ulid.new` writes and a run directory is named by.
+RUN_METAVAR = "<ULID>"
+_RUN_ID = re.compile(r"[0-9A-HJKMNP-TV-Z]{26}")
+
+
+def _run_id(text: str) -> str:
+    """`--run`, admitted only as a run id: a value of any other shape names no run directory."""
+    if not _RUN_ID.fullmatch(text):
+        raise argparse.ArgumentTypeError(f"{text!r} is not a run id")
+    return text
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
         prog="exeris-agent",
@@ -1384,7 +1574,8 @@ def parser() -> argparse.ArgumentParser:
     baseline.add_argument("--close", action="store_true",
                           help="measure the run named by --run and print what a group record "
                                "carries")
-    baseline.add_argument("--run", metavar="<ULID>", help="the baseline to close")
+    baseline.add_argument("--run", type=_run_id, metavar=RUN_METAVAR,
+                          help="the baseline to close")
     baseline.set_defaults(handler=cmd_baseline)
 
     status = subcommands.add_parser("status", help="list the runs on this machine",
@@ -1392,11 +1583,24 @@ def parser() -> argparse.ArgumentParser:
                                                 "oldest first.")
     status.set_defaults(handler=cmd_status)
 
+    drive_run = subcommands.add_parser(
+        "drive", help="run the arm headlessly, with the oracle judging after every pass",
+        description="Launch the run's adapter headless in its worktree, under the run's own "
+                    "environment. After each pass the oracle judges the tree; where it says "
+                    "FALSE_DONE and rounds remain, the same session is resumed with the failing "
+                    "checks, and nothing else, as its prompt.")
+    drive_run.add_argument("--run", required=True, type=_run_id, metavar=RUN_METAVAR,
+                           help="the open run to drive; it was opened with --prompt-file")
+    drive_run.add_argument("--oracle-rounds", type=int, default=0, metavar="<n>",
+                           help="feedback rounds allowed after the first pass; 0, the default, "
+                                "is a single pass")
+    drive_run.set_defaults(handler=cmd_drive)
+
     close_run = subcommands.add_parser(
         "close-run", help="push, open the draft pull request, write the run record",
         description="End a run as the execution identity: push its branch, open its draft pull "
                     "request, and stage the run record beside the session stream it references.")
-    close_run.add_argument("--run", required=True, metavar="<ULID>",
+    close_run.add_argument("--run", required=True, type=_run_id, metavar=RUN_METAVAR,
                            help="the run to close")
     close_run.add_argument("--no-pr", action="store_true",
                            help="push, but open no pull request")

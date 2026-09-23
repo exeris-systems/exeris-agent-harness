@@ -11,6 +11,11 @@
 # the adapter counts and what is carried into the streams repository. A run launched without it
 # leaves no record of itself beyond its commits.
 #
+# The redirection appends. A driven run resumes one conversation in several invocations, and the
+# conversation is one session: its stream is every invocation's events in the order they ran, never
+# the last invocation's alone. A run's directory starts without the file, so a single pass writes
+# exactly what it always did.
+#
 # `--log-file` is the client's own diagnostic log and is not that stream. It is kept beside the run
 # so that a failure to produce a stream has somewhere to be read from, and it is never carried.
 #
@@ -36,4 +41,4 @@ exec agy --output-format stream-json \
          --mode accept-edits \
          --print="$(cat "${prompt_file}")" \
          --log-file "${run_dir}/agy.log" \
-         "$@" > "${run_dir}/agy.jsonl"
+         "$@" >> "${run_dir}/agy.jsonl"

@@ -102,13 +102,21 @@ LOCAL_SNAPSHOT = hashlib.sha256(LOCAL_WEIGHTS).hexdigest()
 LOCAL_FENCE = f"{FENCE}-w-{LOCAL_SNAPSHOT[:12]}"
 
 
+#: The same client driven with the oracle in the loop, allowed this many feedback rounds. A loop
+#: changes what a row's cost is a cost of, so its rows sit on a producer of their own.
+ORACLE_ROUNDS = 2
+ORACLE_FENCE = (f"2026-09-19-harness-claude-oracle{ORACLE_ROUNDS}"
+                f"-cc-{CLIENT_VERSION.replace('.', '-')}")
+
+
 def _entry(fence, producer):
     return (f"| `{fence}` | 2026-09-19 | harness, {producer} | placeholder: the producer these "
             f"tests run as, entered so its rows have an id to resolve | placeholder entry |\n")
 
 
 REGISTER_ENTRIES = (_entry(FENCE, "claude"), _entry(AGY_FENCE, "antigravity"),
-                    _entry(LOCAL_FENCE, "claude over local weights"))
+                    _entry(LOCAL_FENCE, "claude over local weights"),
+                    _entry(ORACLE_FENCE, f"claude driven with {ORACLE_ROUNDS} oracle rounds"))
 
 #: Where the row contract is read from. A checkout that does not have it skips these cases rather
 #: than checking a row against a copy: a second copy of a contract is a second answer.

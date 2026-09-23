@@ -17,8 +17,8 @@ harness does is in [`README.md`](README.md); this file is the entry point an age
 This repository is the harness that gives work an agent carries out end to end its own identity —
 a GitHub App bound to a worktree rather than to a shell — so that such work is distinguishable in
 the commit graph from a maintainer's own work and from work an agent was steered through line by
-line. V0 is four commands (`open-run`, `close-run`, `flush`, `baseline`) plus the modules under
-`harness/` and the per-vendor launchers under `adapters/` that back them.
+line. V0 is five commands (`open-run`, `drive`, `close-run`, `flush`, `baseline`) plus the modules
+under `harness/` and the per-vendor launchers and readers under `adapters/` that back them.
 
 ## Operating contract and safety boundaries
 
@@ -43,8 +43,8 @@ line. V0 is four commands (`open-run`, `close-run`, `flush`, `baseline`) plus th
 
 | Path | What it holds |
 | :-- | :-- |
-| [`harness/`](harness) | The commands and the seams they share: `cli.py`, `token.py`, `worktree.py`, `runner.py`, `record.py`, `oracle.py`, `providers.py`, `capture.py`. |
-| [`adapters/<vendor>/`](adapters) | One launcher and one session reader per vendor CLI (`claude`, `codex`, `gemini`, `antigravity`) — never a second place a row's fields are computed. |
+| [`harness/`](harness) | The commands and the seams they share: `cli.py`, `token.py`, `worktree.py`, `runner.py`, `record.py`, `oracle.py`, `drive.py`, `providers.py`, `capture.py`. |
+| [`adapters/<vendor>/`](adapters) | One launcher and one session reader per vendor CLI (`claude`, `codex`, `gemini`, `antigravity`), and a headless pass where `drive` can run one — never a second place a row's fields are computed. |
 | [`bin/exeris-agent`](bin/exeris-agent) | The CLI entry point; holds no logic beyond putting the checkout on the import path. |
 | [`policy/README.md`](policy/README.md) | The map to the identity's ceiling and the organisation's rulesets — the boundary is configuration, this page points at it. |
 | [`identity/app-manifest.json`](identity/app-manifest.json) | The App's own permissions and hook settings, published so another organisation can instantiate its own identity. |

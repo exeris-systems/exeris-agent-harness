@@ -18,8 +18,15 @@ not, and no code path here can reach them.
 **What is deliberately not returned: text.** The first prompt is hashed where it is read, because
 the digest is what the model reference needs and the text may be private material. No prompt, file
 or tool argument leaves this module.
+
+**What is counted as steering: a person's prompts, never the oracle's.** A run driven with the
+oracle in the loop resumes its session with prompts the harness wrote from failing gates, and the
+harness passes their digests in. A prompt whose digest is one of those is the instrument speaking
+and is not counted; every one of them has to be found, because a recorded prompt the log does not
+hold leaves the remaining prompts unattributable, and the count is then refused rather than guessed.
 """
 
+import collections
 import datetime
 import hashlib
 import json
@@ -205,8 +212,121 @@ def _prompt_text(content) -> str | None:
     return text or None
 
 
-def read(path: str) -> dict:
+def _entries(raw: bytes):
+    """Every line of the log that parses as a JSON object, in order.
+
+    A line that does not parse, or parses as something else, is not an entry. The count of what is
+    yielded is `event_count`: what keeps the row summarisable by once the stream itself has been
+    taken away by a retention window.
+    """
+    for line in raw.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(entry, dict):
+            yield entry
+
+
+class _Tally:
+    """What `read` accumulates over one log, one entry at a time."""
+
+    def __init__(self, oracle_prompts):
+        self.event_count = 0
+        self.versions: set[str] = set()
+        self.main_models: set[str] = set()
+        self.side_models: set[str] = set()
+        self.turns: set[str] = set()
+        self.tool_calls = 0
+        self.usage: dict[str, dict] = {}
+        self.prompts = 0
+        self.denials = 0
+        self.first_prompt_sha256 = None
+        self.pending = collections.Counter(oracle_prompts)
+        self.from_oracle = 0
+
+    def add(self, entry: dict) -> None:
+        self.event_count += 1
+        version = entry.get("version")
+        if isinstance(version, str) and version:
+            self.versions.add(version)
+        kind = entry.get("type")
+        sidechain = bool(entry.get("isSidechain"))
+        message = entry.get("message") if isinstance(entry.get("message"), dict) else {}
+        if kind == "assistant":
+            self._assistant(message, sidechain)
+        elif kind == "user":
+            self._user(entry, message, sidechain)
+
+    def _assistant(self, message: dict, sidechain: bool) -> None:
+        model = message.get("model")
+        if _is_model(model):
+            (self.side_models if sidechain else self.main_models).add(model)
+        # A turn is a message, and one message reaches the log as several lines when it carries
+        # several content blocks. The id is what collapses them; a line without one contributes no
+        # turn and no usage, because a measurement that cannot be de-duplicated would be counted as
+        # often as the client happened to write it.
+        message_id = message.get("id")
+        if isinstance(message_id, str) and message_id:
+            if not sidechain:
+                self.turns.add(message_id)
+            if message_id not in self.usage:
+                self.usage[message_id] = _usage(message.get("usage"))
+        self.tool_calls += _tool_uses(message.get("content"))
+
+    def _user(self, entry: dict, message: dict, sidechain: bool) -> None:
+        if entry.get("toolDenialKind") is not None:
+            self.denials += 1
+        if sidechain or entry.get("isMeta"):
+            return
+        text = _prompt_text(message.get("content"))
+        if text is None:
+            return
+        self.prompts += 1
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if self.first_prompt_sha256 is None:
+            self.first_prompt_sha256 = digest
+        elif self.pending[digest] > 0:
+            self.pending[digest] -= 1
+            self.from_oracle += 1
+
+    def model_id(self, path: str) -> str:
+        """The one model the session ran under, or `NoRow` where the log states anything else."""
+        if not self.versions:
+            raise NoRow("harness-version-absent", path)
+        if len(self.versions) > 1:
+            raise NoRow("harness-version-moved", ", ".join(sorted(self.versions)))
+        if not self.main_models:
+            raise NoRow("model-absent", path)
+        if len(self.main_models) > 1:
+            raise NoRow("multi-model", ", ".join(sorted(self.main_models)))
+        model_id = sorted(self.main_models)[0]
+        divergent = sorted(self.side_models - {model_id})
+        if divergent:
+            raise NoRow("subagent-model-divergence", ", ".join(divergent))
+        unmatched = sum(self.pending.values())
+        if unmatched:
+            raise NoRow("oracle-prompt-unmatched",
+                        f"{unmatched} prompt(s) the oracle loop recorded sending are not in {path}")
+        return model_id
+
+    def totals(self) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for counted in self.usage.values():
+            for name, value in counted.items():
+                out[name] = out.get(name, 0) + value
+        return out
+
+
+def read(path: str, *, oracle_prompts=()) -> dict:
     """Everything the row needs from one session log, in counts and digests.
+
+    `oracle_prompts` are the digests of the prompts an oracle loop sent into this session, one per
+    feedback round and repeated where two rounds sent the same text. Each is matched against one
+    prompt after the first; the ones matched are not steering.
 
     Raises `NoRow` where the log describes something the record cannot state: two models on the
     main chain, a subagent on a third, or a client version that moved under the session. Each of
@@ -219,100 +339,28 @@ def read(path: str) -> dict:
     except OSError as exc:
         raise NoRow("session-unreadable", str(exc)) from None
 
-    event_count = 0
-    versions: set[str] = set()
-    main_models: set[str] = set()
-    side_models: set[str] = set()
-    turns: set[str] = set()
-    tool_calls = 0
-    usage: dict[str, dict] = {}
-    prompts = 0
-    denials = 0
-    first_prompt_sha256 = None
-
-    for line in raw.decode("utf-8", "replace").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entry = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if not isinstance(entry, dict):
-            continue
-        # Every line the log holds and this module could parse. It is what `event_count` keeps the
-        # row summarisable by once the stream itself has been taken away by a retention window.
-        event_count += 1
-
-        version = entry.get("version")
-        if isinstance(version, str) and version:
-            versions.add(version)
-
-        kind = entry.get("type")
-        sidechain = bool(entry.get("isSidechain"))
-        message = entry.get("message") if isinstance(entry.get("message"), dict) else {}
-
-        if kind == "assistant":
-            model = message.get("model")
-            if _is_model(model):
-                (side_models if sidechain else main_models).add(model)
-            # A turn is a message, and one message reaches the log as several lines when it carries
-            # several content blocks. The id is what collapses them; a line without one contributes
-            # no turn and no usage, because a measurement that cannot be de-duplicated would be
-            # counted as often as the client happened to write it.
-            message_id = message.get("id")
-            if isinstance(message_id, str) and message_id:
-                if not sidechain:
-                    turns.add(message_id)
-                if message_id not in usage:
-                    usage[message_id] = _usage(message.get("usage"))
-            tool_calls += _tool_uses(message.get("content"))
-        elif kind == "user":
-            if entry.get("toolDenialKind") is not None:
-                denials += 1
-            if sidechain or entry.get("isMeta"):
-                continue
-            text = _prompt_text(message.get("content"))
-            if text is None:
-                continue
-            prompts += 1
-            if first_prompt_sha256 is None:
-                first_prompt_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-    if not versions:
-        raise NoRow("harness-version-absent", path)
-    if len(versions) > 1:
-        raise NoRow("harness-version-moved", ", ".join(sorted(versions)))
-    if not main_models:
-        raise NoRow("model-absent", path)
-    if len(main_models) > 1:
-        raise NoRow("multi-model", ", ".join(sorted(main_models)))
-    model_id = sorted(main_models)[0]
-    divergent = sorted(side_models - {model_id})
-    if divergent:
-        raise NoRow("subagent-model-divergence", ", ".join(divergent))
-
-    totals: dict[str, int] = {}
-    for counted in usage.values():
-        for name, value in counted.items():
-            totals[name] = totals.get(name, 0) + value
+    tally = _Tally(oracle_prompts)
+    for entry in _entries(raw):
+        tally.add(entry)
+    model_id = tally.model_id(path)
 
     return {
         "path": path,
         "sha256": hashlib.sha256(raw).hexdigest(),
-        "event_count": event_count,
+        "event_count": tally.event_count,
         "model_id": model_id,
         "client": CLIENT,
-        "version": sorted(versions)[0],
-        "turns": len(turns),
-        "tool_calls": tool_calls,
-        "usage": totals,
+        "version": min(tally.versions),
+        "turns": len(tally.turns),
+        "tool_calls": tally.tool_calls,
+        "usage": tally.totals(),
         # The first prompt is what started the run; what is counted here is steering, which is why
-        # a run asked once and left to finish is `0` rather than `1`.
-        "human_prompts": max(prompts - 1, 0),
-        "permission_denials": denials,
+        # a run asked once and left to finish is `0` rather than `1`, and the oracle's prompts are
+        # not steering at all.
+        "human_prompts": max(tally.prompts - 1 - tally.from_oracle, 0),
+        "permission_denials": tally.denials,
         # The prompt's own digest, which the record composes with the rest of what instructed the
         # run. The text was hashed where it was read and is not here.
-        "system_prompt_sha256": first_prompt_sha256,
+        "system_prompt_sha256": tally.first_prompt_sha256,
         "capture_level": "full",
     }
