@@ -21,7 +21,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # The row contract the suite writes rows against lives in the execution repository and is
+      # read from a checkout of it, never copied here; without it the cases that need a schema
+      # skip, and a suite that skipped its rows is not the suite this check is named for.
+      - uses: actions/checkout@v7
+        with: { repository: exeris-systems/exeris-ai-execution, path: _execution }
       - uses: actions/setup-python@v7
         with: { python-version: '3.14' }
       - name: Every rule of the harness, as a case that can fail
-        run: python3 -m unittest discover -s tests -p '*_test.py'
+        env:
+          EXERIS_EXECUTION_REPO: ${{ github.workspace }}/_execution
+        run: |
+          python3 -m unittest discover -s tests -p '*_test.py' 2>&1 | tee suite.out
+          ! grep -q "skipped=" suite.out

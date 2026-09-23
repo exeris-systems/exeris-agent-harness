@@ -57,7 +57,9 @@ jobs:
          "commit-lint": "${{ needs.commits.result }}",
          "pr-body-check": "${{ needs.pr-body.result }}"}
       repo-routine: docs/repo-review-rules.md
-      repo-checks: python3 -m unittest discover -s tests -p '*_test.py'
+      repo-checks: >-
+        git clone --quiet --depth 1 https://github.com/exeris-systems/exeris-ai-execution _execution
+        && EXERIS_EXECUTION_REPO="$PWD/_execution" python3 -m unittest discover -s tests -p '*_test.py'
     secrets:
       claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       exeris_bot_app_id: ${{ secrets.EXERIS_BOT_APP_ID }}
