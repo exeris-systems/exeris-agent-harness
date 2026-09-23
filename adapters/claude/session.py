@@ -350,7 +350,7 @@ def read(path: str, *, oracle_prompts=()) -> dict:
         "event_count": tally.event_count,
         "model_id": model_id,
         "client": CLIENT,
-        "version": sorted(tally.versions)[0],
+        "version": min(tally.versions),
         "turns": len(tally.turns),
         "tool_calls": tally.tool_calls,
         "usage": tally.totals(),

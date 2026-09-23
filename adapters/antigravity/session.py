@@ -360,7 +360,7 @@ def read(path: str, *, oracle_prompts=()) -> dict:
         "path": path,
         "sha256": hashlib.sha256(raw).hexdigest(),
         "event_count": tally.event_count,
-        "model_id": sorted(tally.models)[0],
+        "model_id": min(tally.models),
         "client": CLIENT,
         "version": client_version,
         # The client's own count of the turns it took, rather than a count of the steps it wrote:
