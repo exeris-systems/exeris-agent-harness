@@ -29,6 +29,7 @@ adds::
     domain          = "…"        # the oracle domain of the work done there
     scope           = […]        # the vocabulary `--scope` is checked against
     routine         = "…"        # the routine file a run there follows, hashed into the record
+    readable        = ["…"]      # directories every driven pass may read, passed as `--add-dir`
 
     [providers.<name>]           # one arm: a model behind a client, under a ledger — `providers`
     …                            # owns the shape, and this module only carries the tables through
@@ -51,6 +52,11 @@ reports the network is not a gate.
 
 Scalars are read from `[github]` first and from the document root second, so a file that grew the
 added fields at the top level is understood the same way as one that put them beside the App's own.
+
+`readable` names the directories outside the worktree a driven pass is given to read — the
+standards the work is judged against, say. They are part of what every pass of a run there was
+allowed, so they are a property of the repository and not of the arm: two arms of one group read
+the same directories. A relative path is read beside the configuration file.
 
 A `[repos.<name>]` table is addressed by the bare repository name, and a table written as
 `owner/name` resolves to the same entry: the two spellings name one repository, and a configured
@@ -81,6 +87,7 @@ class Repo:
     domain: str | None = None
     scope: tuple[str, ...] = ()
     routine: str | None = None
+    readable: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -199,11 +206,17 @@ def load(path: str | None = None) -> Config:
         scope = table.get("scope") or ()
         if isinstance(scope, str):
             scope = (scope,)
+        readable = table.get("readable") or ()
+        if isinstance(readable, str):
+            readable = (readable,)
+        if not all(isinstance(entry, str) and entry for entry in readable):
+            raise ConfigError(f"{resolved}: [repos.{name}].readable is not a list of paths")
         repos[name] = Repo(name=name,
                            path=table.get("path"),
                            domain=table.get("domain"),
                            scope=tuple(scope),
-                           routine=table.get("routine"))
+                           routine=table.get("routine"),
+                           readable=tuple(readable))
 
     oracle_table = document.get("oracle") or {}
     if not isinstance(oracle_table, dict):

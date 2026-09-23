@@ -71,6 +71,13 @@ REASONS = (
     # arm's measurement. Every row of such a group carries it identically, so a row written without
     # it is a row of a group nobody can interpret.
     "human-baseline-absent",
+    # The run was driven with the oracle in the loop and the session does not hold every prompt the
+    # loop recorded sending. The prompts that remain cannot be told apart as the oracle's or a
+    # person's, so the steering count has no value this producer could state.
+    "oracle-prompt-unmatched",
+    # The run's drive record exists and cannot be read. It says the run was driven; without it, the
+    # oracle's prompts would be counted as a person's and the row would sit on the wrong fence.
+    "drive-record-unreadable",
 )
 
 
@@ -94,7 +101,8 @@ class NoRow(Exception):
 #: ``turns`` / ``tool_calls``            `execution`'s two required counts
 #: ``usage``                 token counts under `accounting.usage`'s own four names
 #: ``wall_time_ms``          what the runtime says the work took, where it says so at all
-#: ``human_prompts``         prompts a person submitted after the first
+#: ``human_prompts``         prompts a person submitted after the first — never one the oracle
+#:                           loop sent, which `read(path, oracle_prompts=…)` is told of by digest
 #: ``permission_denials``    tool calls the client refused
 #: ``system_prompt_sha256``  the run's own prompt, hashed where it was read. It is the FIRST
 #:                           COMPONENT of the row's `agent.system_prompt_sha256` and not that

@@ -9,8 +9,9 @@ The harness separates them by giving the third kind its own principal — the or
 execution identity, a GitHub App — and by binding that identity to a worktree rather than to a
 shell, so that the boundary holds when the agent opens a second terminal.
 
-**V0 is four commands: one opens a run, one closes it, one carries what it produced, and one
-measures the person doing the same work.** A run is:
+**V0 is five commands: one opens a run, one drives it headlessly with the oracle in the loop, one
+closes it, one carries what it produced, and one measures the person doing the same work.** A run
+is:
 
 - a **worktree** on a branch of its own, cut from `origin/<default>`: the attribution boundary.
   Anything committed inside it is the run's, including a line a person types there — that is
@@ -62,6 +63,36 @@ defaults — `claude`, `codex`, `gemini` — which declare a vendor CLI's own ve
 leave the ledger to the table, because which ledger a vendor CLI bills to is a property of the
 login it runs under. `--task adhoc` opens an unplanned run, which is capturable but never paired,
 so `--group` requires a registry entry. `exeris-agent status` lists the runs on the machine.
+
+`drive` runs the arm with nobody at it, which is how a paired group measures what the work cost to
+reach `TRUE_DONE` rather than what one pass happened to leave:
+
+```sh
+bin/exeris-agent open-run --repo exeris-systems/exeris-docs --task reg:<id> --provider claude \
+                          --scope <scope> --prompt-file <task.md>
+bin/exeris-agent drive     --run <ULID> --oracle-rounds 3
+bin/exeris-agent close-run --run <ULID>
+```
+
+It launches the arm's adapter headless in the run's tree, under the environment `open-run` wrote,
+with every directory the repository's `readable` names passed as `--add-dir`. After each pass the
+oracle judges the tree. Where the admitted outcome is `FALSE_DONE` and rounds remain, the **same
+session** is resumed — the client's own session id, `--resume` for Claude Code and `--conversation`
+for Antigravity, read from what the previous pass printed — with a prompt that is a fixed template
+around each failing gate's check and detail, verbatim, and nothing else. The loop stops at
+`TRUE_DONE`, at `UNKNOWN` (an instrument that could not judge is never looped on), or when
+`--oracle-rounds` feedback rounds have been sent; `0`, the default, is a single pass. A client that
+names no session to resume is refused a loop rather than given a new session.
+
+Each round is recorded in `<run>/drive.json` — its number, the digest of its prompt, the outcome
+after it and the time the pass took — and the feedback prompts are kept beside it in `<run>/drive/`,
+because they are instrument output and not the task. `close-run` reads that record: the oracle's
+prompts are not counted in `execution.human_prompts` (a recorded one the session does not hold is a
+refusal, not a zero), the row sits on the fence `…-harness-<adapter>-oracle<N>-cc-…` for a loop
+allowed `N` rounds, and the rounds used are staged in `staging/drive.json` and printed — the row
+has no field for them. `drive` is a command of its own rather than `open-run --drive` because
+`--launch` hands the process to the client for a person to work in, and a loop has to outlive the
+pass it launched.
 
 `baseline` is **the human arm**, and the one command that acts as nobody but the person:
 
@@ -152,6 +183,9 @@ domain          = "…"      # which oracle judges work done here, spelled as th
 scope           = ["…"]    # the vocabulary --scope is checked against
 routine         = "…"      # the routine a run here follows, hashed into the record with the
                            # prompt and the agent file; omitted where there is none
+readable        = ["…"]    # directories outside the worktree every `drive` pass may read, passed
+                           # as `--add-dir`; a property of the repository, so every arm of a group
+                           # reads the same ones, and a path that is not a directory is refused
 ```
 
 A run against a repository the configuration says nothing about opens and closes, and yields no
@@ -265,10 +299,10 @@ everything it does not carry is absent from the row rather than zero:
 | `agent.model_id` | the `init` event's model |
 | `agent.harness` | `antigravity`, at the version the launcher recorded when the run started |
 | `execution.turns` | the closing event's own turn count |
-| `execution.tool_calls` | steps, collapsed by index, whose type is neither `user_input` nor `agent_response` |
-| `execution.human_prompts` | `user_input` steps less the one that started the run |
-| `accounting.usage` | the closing event's input, output and cache-read counts |
-| `execution.wall_time_ms` | the closing event's duration |
+| `execution.tool_calls` | steps, collapsed by index, whose type is none of `user_input`, `agent_response`, `system_message` |
+| `execution.human_prompts` | `user_input` steps less the one that started the run and less one per oracle round a `drive` sent |
+| `accounting.usage` | the last closing event's input, output and cache-read counts — a resumed conversation's closing event carries the conversation's totals |
+| `execution.wall_time_ms` | the closing event's duration where there is one closing event; with more, the run's own clock |
 | `execution.permission_denials` | steps whose state names a refusal — **absent** where no state in the stream names one |
 | `execution.capture_level` | `full` where a refusal was observed, `counts-only` otherwise |
 | `agent.system_prompt_sha256` | the `--prompt-file` the harness passed, composed as for every other arm |

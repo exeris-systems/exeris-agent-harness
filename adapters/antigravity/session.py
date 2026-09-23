@@ -19,6 +19,20 @@ statements, and `capture_level` is what tells a reader which one a row is making
 this module. The prompt reaches the client on its command line, and the digest the model reference
 needs is taken from that file where the harness reads it — not from here, because the stream
 carries no prompt text to take it from.
+
+**A driven run is one conversation in several invocations.** Each invocation opens with its own
+`init`, the launcher appends them all to one stream, and a resumed invocation's step indices carry
+on from the last one's — so steps still collapse by index across the whole conversation. The
+closing event of a resumed invocation carries the conversation's totals so far, turns and tokens
+alike, so the last closing event is the session's. Its duration is not: what a resumed invocation's
+duration covers is unmeasured, so a stream with more than one closing event states no duration and
+the record takes the run's own clock. Two conversations in one stream are two sessions and are
+refused.
+
+**The oracle's prompts are not steering.** The stream carries no prompt text, so they cannot be
+matched by digest as the other client's are. They are matched by invocation instead: each feedback
+round is one resumed invocation, and the prompt that opens it is the oracle's. Every recorded round
+needs a resumed invocation that opened with a prompt, or the count is refused rather than guessed.
 """
 
 import hashlib
@@ -51,7 +65,9 @@ VERSION_FILE = "agy.version"
 #: after the first. A stream that never spells it is a stream whose vocabulary is not this one, and
 #: it is refused rather than counted — see `read`.
 PROMPT_STEP = "user_input"
-CONVERSATION = (PROMPT_STEP, "agent_response")
+#: `system_message` is the client's own line into the conversation — a resumed invocation writes
+#: one before the model answers — and is conversation rather than tool work.
+CONVERSATION = (PROMPT_STEP, "agent_response", "system_message")
 
 #: A step state that names a refusal. The client's state vocabulary is unmeasured beyond the states
 #: a completed step passes through, so this matches the word rather than a list: where no state in
@@ -158,8 +174,11 @@ def _usage(reported) -> dict:
     return out
 
 
-def read(path: str) -> dict:
+def read(path: str, *, oracle_prompts=()) -> dict:
     """Everything the row needs from one stream, in counts and digests.
+
+    `oracle_prompts` are the digests of the prompts an oracle loop sent, one per feedback round.
+    Only their number is used here, because the stream carries no text to match them against.
 
     Steps are collapsed by their index before anything is counted, because a step reaches the
     stream once per state it passes through and a measurement counted per update would report the
@@ -176,6 +195,10 @@ def read(path: str) -> dict:
     steps: dict[object, str] = {}
     states: dict[object, set[str]] = {}
     result = None
+    results = 0
+    invocation = 0
+    opened_by: dict[object, int] = {}
+    conversations: set[str] = set()
 
     for line in raw.decode("utf-8", "replace").splitlines():
         line = line.strip()
@@ -192,7 +215,11 @@ def read(path: str) -> dict:
         event_count += 1
 
         event = entry.get("event")
+        named = entry.get("conversation_id")
+        if isinstance(named, str) and named:
+            conversations.add(named)
         if event == "init":
+            invocation += 1
             model = (entry.get("init") or {}).get("model")
             if _is_model(model):
                 models.add(model)
@@ -204,6 +231,8 @@ def read(path: str) -> dict:
             kind = step.get("step_type")
             if isinstance(kind, str) and kind:
                 steps[index] = kind
+                if kind == PROMPT_STEP:
+                    opened_by.setdefault(index, invocation)
             elif index not in steps:
                 steps[index] = ""
             state = step.get("state")
@@ -211,6 +240,7 @@ def read(path: str) -> dict:
                 states.setdefault(index, set()).add(state)
         elif event == "result" and isinstance(entry.get("result"), dict):
             result = entry["result"]
+            results += 1
 
     if not models:
         raise NoRow("model-absent", path)
@@ -218,6 +248,8 @@ def read(path: str) -> dict:
         # Two models named in one stream is two sessions in one file. `agent.model_id` is singular
         # and names the model that took the turns, so neither of them is this run's.
         raise NoRow("multi-model", ", ".join(sorted(models)))
+    if len(conversations) > 1:
+        raise NoRow("multiple-sessions", ", ".join(sorted(conversations)))
     if result is None:
         # The totals — turns, tokens, wall time — are all the closing event's. A stream without one
         # is a session this adapter cannot count, whatever else it holds.
@@ -254,6 +286,13 @@ def read(path: str) -> dict:
                     f"its prompts")
 
     prompts = sum(1 for kind in steps.values() if kind == PROMPT_STEP)
+    # The invocations after the first that opened with a prompt: each is a place a feedback round
+    # could have been sent, and there have to be at least as many as the loop recorded sending.
+    resumed = len({number for number in opened_by.values() if number > 1})
+    if len(oracle_prompts) > resumed:
+        raise NoRow("oracle-prompt-unmatched",
+                    f"the oracle loop recorded {len(oracle_prompts)} feedback round(s) and {path} "
+                    f"holds {resumed} resumed invocation(s) that opened with a prompt")
     tool_calls = sum(1 for kind in steps.values() if kind and kind not in CONVERSATION)
 
     # A step whose state names a refusal, counted. Where no state in the stream names one, the
@@ -264,7 +303,7 @@ def read(path: str) -> dict:
     seconds = result.get("duration_seconds")
     wall_time_ms = (max(int(round(float(seconds) * 1000)), 0)
                     if isinstance(seconds, (int, float)) and not isinstance(seconds, bool)
-                    else None)
+                    and results == 1 else None)
 
     return {
         "path": path,
@@ -284,7 +323,8 @@ def read(path: str) -> dict:
         # there is no count to take, and the row carries none: this adapter's rule throughout is
         # that what the stream does not carry is absent, and a `0` there would be the one shape of
         # the rule that reads as a measurement.
-        "human_prompts": max(prompts - 1, 0) if prompts else None,
+        # The oracle's prompts are the instrument's and are not steering.
+        "human_prompts": max(prompts - 1 - len(oracle_prompts), 0) if prompts else None,
         "permission_denials": denials or None,
         # The stream carries no prompt text. The digest of what instructed the run comes from the
         # file the harness passed the client, which is why this adapter cannot be run without one.

@@ -18,8 +18,15 @@ not, and no code path here can reach them.
 **What is deliberately not returned: text.** The first prompt is hashed where it is read, because
 the digest is what the model reference needs and the text may be private material. No prompt, file
 or tool argument leaves this module.
+
+**What is counted as steering: a person's prompts, never the oracle's.** A run driven with the
+oracle in the loop resumes its session with prompts the harness wrote from failing gates, and the
+harness passes their digests in. A prompt whose digest is one of those is the instrument speaking
+and is not counted; every one of them has to be found, because a recorded prompt the log does not
+hold leaves the remaining prompts unattributable, and the count is then refused rather than guessed.
 """
 
+import collections
 import datetime
 import hashlib
 import json
@@ -205,8 +212,12 @@ def _prompt_text(content) -> str | None:
     return text or None
 
 
-def read(path: str) -> dict:
+def read(path: str, *, oracle_prompts=()) -> dict:
     """Everything the row needs from one session log, in counts and digests.
+
+    `oracle_prompts` are the digests of the prompts an oracle loop sent into this session, one per
+    feedback round and repeated where two rounds sent the same text. Each is matched against one
+    prompt after the first; the ones matched are not steering.
 
     Raises `NoRow` where the log describes something the record cannot state: two models on the
     main chain, a subagent on a third, or a client version that moved under the session. Each of
@@ -229,6 +240,8 @@ def read(path: str) -> dict:
     prompts = 0
     denials = 0
     first_prompt_sha256 = None
+    pending = collections.Counter(oracle_prompts)
+    from_oracle = 0
 
     for line in raw.decode("utf-8", "replace").splitlines():
         line = line.strip()
@@ -276,8 +289,12 @@ def read(path: str) -> dict:
             if text is None:
                 continue
             prompts += 1
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
             if first_prompt_sha256 is None:
-                first_prompt_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                first_prompt_sha256 = digest
+            elif pending[digest] > 0:
+                pending[digest] -= 1
+                from_oracle += 1
 
     if not versions:
         raise NoRow("harness-version-absent", path)
@@ -291,6 +308,10 @@ def read(path: str) -> dict:
     divergent = sorted(side_models - {model_id})
     if divergent:
         raise NoRow("subagent-model-divergence", ", ".join(divergent))
+    unmatched = sum(pending.values())
+    if unmatched:
+        raise NoRow("oracle-prompt-unmatched",
+                    f"{unmatched} prompt(s) the oracle loop recorded sending are not in {path}")
 
     totals: dict[str, int] = {}
     for counted in usage.values():
@@ -308,8 +329,9 @@ def read(path: str) -> dict:
         "tool_calls": tool_calls,
         "usage": totals,
         # The first prompt is what started the run; what is counted here is steering, which is why
-        # a run asked once and left to finish is `0` rather than `1`.
-        "human_prompts": max(prompts - 1, 0),
+        # a run asked once and left to finish is `0` rather than `1`, and the oracle's prompts are
+        # not steering at all.
+        "human_prompts": max(prompts - 1 - from_oracle, 0),
         "permission_denials": denials,
         # The prompt's own digest, which the record composes with the rest of what instructed the
         # run. The text was hashed where it was read and is not here.
