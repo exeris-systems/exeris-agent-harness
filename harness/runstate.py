@@ -272,6 +272,7 @@ RUN_ENV_KEYS = (
     "GIT_COMMITTER_NAME",
     "GIT_COMMITTER_EMAIL",
     "EXERIS_RUN",
+    "EXERIS_PR_BODY",
     "GITHUB_TOKEN",
     # What the run exports for its adapter: which model it is to launch, and where the task text
     # is. A person's own command has no business reading either.
@@ -306,6 +307,8 @@ def env_values(run_dir: str, *, run_id: str, token: str, user_name: str,
         "GIT_COMMITTER_NAME": user_name,
         "GIT_COMMITTER_EMAIL": user_email,
         "EXERIS_RUN": run_id,
+        # Where the arm writes the pull request's body; `close-run` reads it from there.
+        "EXERIS_PR_BODY": os.path.join(run_dir, "body", "pr-body.md"),
     }
 
 

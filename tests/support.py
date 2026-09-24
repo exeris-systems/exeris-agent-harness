@@ -42,6 +42,15 @@ SESSION = FIXTURES / "session.jsonl"
 AGY_STREAM = FIXTURES / "agy-stream.jsonl"
 FAKE_GH = FIXTURES / "fake_gh.py"
 FAKE_AGY = FIXTURES / "fake_agy.py"
+BODY_CHECK = FIXTURES / "guardrails" / "scripts" / "pr_body_check.py"
+
+#: A pull request body the stand-in check passes: every section filled, every line answered.
+BODY = ("Motivation:\nplaceholder: why\n\nModification:\nplaceholder: what\n\n"
+        "Result:\nplaceholder: what is different\n\n## Classification\n"
+        "Scope class: test-tooling\nWall impact: none\nGenerated files touched: no\n"
+        "TCK obligation: n/a\nCompatibility impact: none\nCross-repo impact: none\n"
+        "ADRs referenced: none\nEvidence state: n/a\n\n## Verification\n"
+        "placeholder: the commands run\n")
 FIXTURE_CWD = "/tmp/placeholder/wt"
 
 CLIENT_ID = "Iv23liTESTclientid"
@@ -259,6 +268,10 @@ class HarnessFixture(unittest.TestCase):
         shutil.copyfile(FAKE_GH, self.bin / "gh")
         (self.bin / "gh").chmod(0o755)
         self.gh_state = self.bin / "gh-state"
+        scripts = self.tmp / "guardrails" / "scripts"
+        scripts.mkdir(parents=True)
+        self.body_check = scripts / "pr_body_check.py"
+        shutil.copyfile(BODY_CHECK, self.body_check)
         shutil.copyfile(FAKE_AGY, self.bin / "agy")
         (self.bin / "agy").chmod(0o755)
 
@@ -335,6 +348,9 @@ class HarnessFixture(unittest.TestCase):
             f'model_id = "{AGY_MODEL}"\n'
             f'credential = "{CREDENTIAL}"\n'
             'adapter = "antigravity"\n'
+            "\n"
+            "[pull_request]\n"
+            f'body_check = "{self.body_check}"\n'
         )
 
     def configure_domain(self, domain):
@@ -403,6 +419,24 @@ class HarnessFixture(unittest.TestCase):
 
     # ---- the harness under test --------------------------------------------------
 
+    def write_body(self, text=BODY, kind="model"):
+        """The pull request body, where the run's arm writes it."""
+        path = self.run_dir(kind) / "body" / "pr-body.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def body_checks(self):
+        """Every invocation of the stand-in template check, as it recorded them."""
+        path = self.body_check.parent / "calls.jsonl"
+        if not path.is_file():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    #: Whether `cli` leaves a model run's body as the case left it. A case about the body sets it;
+    #: every other case closes its run with `BODY` in place, as an arm that wrote one would.
+    keep_body = False
+
     def cli(self, argv):
         """One subcommand in process, with the network call that mints a token replaced."""
         import harness.cli
@@ -415,6 +449,11 @@ class HarnessFixture(unittest.TestCase):
                 module.mint = lambda *a, **k: _Token(token=FAKE_TOKEN, expires_at=FAKE_EXPIRY)
         self.addCleanup(lambda: [setattr(m, "mint", fn) for m, fn in saved])
 
+        if argv and argv[0] == "close-run" and not self.keep_body:
+            run = argv[argv.index("--run") + 1]
+            body = self.state_root / "runs" / run / "body" / "pr-body.md"
+            if body.parent.is_dir() and not body.exists():
+                body.write_text(BODY, encoding="utf-8")
         try:
             code = harness.cli.main(list(argv))
         except SystemExit as stop:

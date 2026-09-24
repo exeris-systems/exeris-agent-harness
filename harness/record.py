@@ -448,54 +448,6 @@ def capture_version(execution_repo: str) -> str:
     return value
 
 
-#: The organisation's pull-request template, as the headings and fields a body has to carry. A run
-#: opens its pull request as a draft with the classification unanswered, because those answers are
-#: the accountable person's: the template gate exempts a draft precisely so that the person who
-#: marks it ready is the one who filled it in.
-_CLASSIFICATION = (
-    ("Scope class", "<runtime hot path | runtime non-hot | test-tooling | docs-only>"),
-    ("Wall impact", "<none | from-module → to-module>"),
-    ("Generated files touched", "<yes | no | n/a>"),
-    ("TCK obligation", "<satisfied | debt #N | n/a>"),
-    ("Compatibility impact", "<none | additive | breaking (ADR-NNN)>"),
-    ("Cross-repo impact", "<none | repo: what must change>"),
-    ("ADRs referenced", "<ADR-NNN, … | none>"),
-    ("Evidence state", "<citable | unartifacted | n/a>"),
-)
-
-
-def pull_request_body(owner_login: str, run_id: str) -> str:
-    """The body of the draft pull request a run's work becomes.
-
-    Exactly one `Owner:` line, naming the organisation member accountable for what the run
-    produced. Accountability does not move to the author field when the author is an application:
-    it moves to this line, and the named person answers for every part of the change in review
-    exactly as an author would.
-    """
-    lines = [
-        "Motivation:",
-        "<!-- Why this change exists: the constraint, failure or measurement. -->",
-        "",
-        "Modification:",
-        "<!-- What changed at the level of contracts, seams and behaviour. -->",
-        "",
-        "Result:",
-        "<!-- What is different now. What is explicitly NOT covered. -->",
-        "",
-        "## Classification",
-    ]
-    lines += [f"{name}: {placeholder}" for name, placeholder in _CLASSIFICATION]
-    lines += [
-        "",
-        "## Verification",
-        "<!-- The exact commands run after the last push, and what they prove. -->",
-        "",
-        f"Owner: @{owner_login}",
-        f"Exeris-Run: {run_id}",
-    ]
-    return "\n".join(lines) + "\n"
-
-
 def inbox_pull_request_body(rows: int, date: str, repositories) -> str:
     """The body of the pull request that carries a batch of rows into the inbox.
 

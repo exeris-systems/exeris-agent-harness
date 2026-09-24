@@ -37,7 +37,7 @@ from adapters.antigravity import drive as agy_drive  # noqa: E402
 from adapters.antigravity import session as agy_session  # noqa: E402
 from adapters.claude import drive as claude_drive  # noqa: E402
 from adapters.claude import session as claude_session  # noqa: E402
-from harness import cli, drive, oracle, record  # noqa: E402
+from harness import cli, drive, oracle, pr_body, record  # noqa: E402
 from harness.capture import NoRow  # noqa: E402
 
 #: Session ids as the client writes them.
@@ -78,6 +78,10 @@ class DriveFixture(support.HarnessFixture):
         self.writes_feedback = True
         self.session_ids = None
         self.conversation = None
+        # What the stand-in writes when it is asked for the pull request's body: one text per body
+        # round, the last repeated, and nothing where the entry is `None`.
+        self.bodies = [support.BODY]
+        self.body_passes = []
 
     def _stub(self, module, name, value):
         original = getattr(module, name)
@@ -91,7 +95,35 @@ class DriveFixture(support.HarnessFixture):
 
     # ---- the stand-in client -------------------------------------------------------
 
+    @staticmethod
+    def _sent(env, prompt):
+        """The text a pass was given, by whichever route its client reads it."""
+        if prompt is not None:
+            return prompt
+        return pathlib.Path(env["EXERIS_PROMPT_FILE"]).read_text(encoding="utf-8")
+
+    def _body_pass(self, argv, env, prompt):
+        """A pass asked for the body: it writes the body and leaves the tree as it was."""
+        text = self._sent(env, prompt)
+        self.body_passes.append({"argv": list(argv), "env": dict(env), "prompt": text})
+        written = self.bodies[min(len(self.body_passes), len(self.bodies)) - 1]
+        where = pathlib.Path(env[pr_body.VARIABLE])
+        if written is None:
+            where.unlink(missing_ok=True)
+        else:
+            where.write_text(written, encoding="utf-8")
+        number = len(self.passes) + len(self.body_passes)
+        if "antigravity" in argv[0]:
+            return self._agy_pass(number, env)
+        self._append_turn(text, number)
+        ids = self.session_ids or [SESSION_ONE]
+        return 0, json.dumps({"type": "result", "session_id": ids[-1],
+                              "result": "placeholder answer"})
+
     def _pass(self, argv, *, cwd, env, stderr_path, prompt=None):
+        text = self._sent(env, prompt)
+        if text.startswith((pr_body.REQUEST.split("{")[0], pr_body.FEEDBACK_HEAD.split("{")[0])):
+            return self._body_pass(argv, env, prompt)
         number = len(self.passes) + 1
         self.passes.append({"argv": list(argv), "env": dict(env), "cwd": cwd, "prompt": prompt})
         self.commit(message=f"docs: round {number}", name=f"round-{number}.txt")
@@ -284,7 +316,10 @@ class LoopTest(DriveFixture):
         for made in self.passes:
             argv = made["argv"]
             given = [argv[i + 1] for i, word in enumerate(argv) if word == "--add-dir"]
-            self.assertEqual([str(directory) for directory in standards], given)
+            # The configured directories, and the one the body is written in: every pass is
+            # allowed what the last one is.
+            self.assertEqual([str(directory) for directory in standards]
+                             + [str(self.run_dir() / pr_body.DIRECTORY)], given)
 
     def test_a_readable_directory_that_is_not_there_is_refused(self):
         self.config_path.write_text(self.config_path.read_text().replace(
@@ -378,8 +413,9 @@ class DrivenRowTest(DriveFixture):
         # The fixture session carries two prompts a person typed after the first; the two the loop
         # sent are in the session too, and are not counted.
         self.assertEqual(2, row["execution"]["human_prompts"])
-        # The whole session is the run's: the turns the resumed passes took are counted with it.
-        self.assertEqual(4 + 2, row["execution"]["turns"])
+        # The whole session is the run's: the turns the resumed passes took are counted with it,
+        # the body's among them.
+        self.assertEqual(4 + 2 + 1, row["execution"]["turns"])
         self.assertEqual("TRUE_DONE", row["outcome"])
 
     def test_a_driven_run_sits_on_the_fence_of_its_loop(self):

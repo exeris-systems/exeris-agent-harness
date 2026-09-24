@@ -29,6 +29,9 @@ under `harness/` and the per-vendor launchers and readers under `adapters/` that
 - **A run never falls back to a person's credential.** Where the identity cannot mint its own
   token, a run refuses to open rather than borrowing the shell's — a change to `harness/token.py`
   or `harness/runstate.py` keeps that failure mode closed, not made silent.
+- **No pull request leaves with a body the organisation's gate would refuse.** `close-run` runs the
+  organisation's own template check over the arm's body before it pushes, and the harness keeps no
+  copy of that check; the template gate's draft exemption is not a way around it.
 - **The harness's own records never reach the inbox under the identity's token.** `close-run` acts
   as the identity and stops at a draft pull request against this repository's own remote; carrying
   a batch into the records inbox is `flush`, and it acts as the person, over their own `gh` and

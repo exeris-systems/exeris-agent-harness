@@ -96,6 +96,15 @@ has no field for them. `drive` is a command of its own rather than `open-run --d
 `--launch` hands the process to the client for a person to work in, and a loop has to outlive the
 pass it launched.
 
+A loop that stops at `TRUE_DONE` has one step left: the same session is asked for the pull
+request's body, written to `<run>/body/pr-body.md` in the organisation's template, and the
+organisation's own template check (`[pull_request] body_check`) is run over it. Its findings, and
+nothing else, are sent back for up to `--body-rounds` rounds (2 by default). The body rounds are
+recorded under `body` in `drive.json`, their prompts are the instrument's and are not counted as a
+person's, and they cost what they cost: to `TRUE_DONE` means to a pull request that can be opened,
+not to a diff. A body round is told not to touch the tree; one that does has the tree judged again,
+and the loop stops on that judgement.
+
 `baseline` is **the human arm**, and the one command that acts as nobody but the person:
 
 ```sh
@@ -125,10 +134,16 @@ identically and a row written before it existed could not. `--no-baseline-requir
 anyway; it invents nothing, and the run's work is pushed while its row is refused with the reason
 that says the baseline could not be read.
 
-`close-run` acts **as the identity**: it pushes the run's branch with the token the run minted,
-opens a draft pull request carrying one `Owner:` line and the run's id, and stages a record beside
-a copy of the session log it references. A draft, because a human marking it ready is the moment a
-person takes on what the run produced. It closes the run either way: where the record cannot be
+`close-run` acts **as the identity**: it checks the pull request body the arm wrote at
+`<run>/body/pr-body.md` (the path the run's environment exports as `EXERIS_PR_BODY`), pushes the
+run's branch with the token the run minted, opens a draft pull request carrying that body with one
+`Owner:` line and the run's id added, and stages a record beside a copy of the session log it
+references. The body is composed and passed through the organisation's template check — as the
+execution identity's pull request, with the ADR rule on where the commits touch an ADR, whose
+`adr` label is then applied — before anything is pushed: a run with no body, or with one the check
+refuses, pushes nothing and opens nothing, and `--no-pr` pushes without asking for one. The gate
+exempts a draft, which is why the check runs here rather than waiting for the ready click. A draft,
+because a human marking it ready is the moment a person takes on what the run produced. It closes the run either way: where the record cannot be
 assembled — two models on the main chain, a client version that moved under the session, a checkout
 with no bundle pin, a client version (or, on a local arm, a set of weights) no fence is registered
 for, a group whose human arm was never measured — the push and the pull request stand and the
@@ -179,6 +194,13 @@ bridge          = "…"      # the Exeris MCP server's `dist/server.js`, absolut
                            # oracle, pinned (package version, and commit where its package
                            # directory is a git checkout) in every run's manifest, and the one
                            # server an arm with `mcp = true` is given
+
+[pull_request]
+body_check      = "…"      # the organisation's `scripts/pr_body_check.py`, in a clone of
+                           # exeris-systems/.github. Every body is checked with it before the
+                           # identity sends it; named rather than copied, so the harness never
+                           # holds a second answer to what the template requires. Without it no
+                           # pull request is opened
 
 [registry]
 path            = "…"      # the local clone of the private task registry. A `reg:T-NNN` run reads

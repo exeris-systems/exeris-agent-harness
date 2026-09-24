@@ -27,6 +27,10 @@ adds::
                                  # the oracle, pinned in each run's manifest, and the one server
                                  # an arm with `mcp = true` is given
 
+    [pull_request]
+    body_check      = "…"        # the organisation's `scripts/pr_body_check.py`, in a clone of
+                                 # exeris-systems/.github: every body is checked with it first
+
     [registry]
     path            = "…"        # the local clone of the private task registry; a `reg:T-NNN` run
                                  # reads `registry/tasks/T-NNN.json` there for its oracle inputs
@@ -71,6 +75,11 @@ arm working in a repository whose table says `mcp = true` is given the same serv
 tools, so the instrument and the arm read one registry through one program. Its version (the
 `package.json` beside `dist/`) and its commit (where the package directory is a git checkout of its
 own) are recorded when a run opens, because a server rebuilt afterwards is a different instrument.
+
+`[pull_request] body_check` is the organisation's template check, run locally over a pull request's
+body before the execution identity sends it. It is named rather than copied, for the reason the
+oracle is imported rather than copied: a second copy of a gate is a second answer to what it
+requires. Without it no pull request is opened — a run can still be pushed with `--no-pr`.
 
 `[registry] path` is where a registered task's own record is read from. What it contributes is the
 task's `oracle_inputs` — for the documentation oracle, the files whose bodies the task must leave as
@@ -136,6 +145,8 @@ class Config:
     bridge: str | None = None
     #: The local clone of the private task registry, where the configuration names one.
     registry: str | None = None
+    #: The organisation's pull-request template check, where the configuration names one.
+    body_check: str | None = None
     repos: dict[str, Repo] = dataclasses.field(default_factory=dict)
     #: The `[providers.<name>]` tables as the file wrote them. They are carried rather than
     #: interpreted: what an arm may declare is `providers`' own, and a second opinion here would
@@ -187,6 +198,11 @@ class Config:
     def registry_path(self) -> str | None:
         """The task registry's clone, absolute, or nothing where none is configured."""
         return self.beside(self.registry) if self.registry else None
+
+    @property
+    def body_check_path(self) -> str | None:
+        """The pull-request template check, absolute, or nothing where none is configured."""
+        return self.beside(self.body_check) if self.body_check else None
 
     @property
     def age_identity_path(self) -> str | None:
@@ -275,8 +291,10 @@ def load(path: str | None = None) -> Config:
 
     oracle_table, registry_table = _table(resolved, document, "oracle"), \
         _table(resolved, document, "registry")
+    pull_request_table = _table(resolved, document, "pull_request")
     for key, value in (("[oracle].bridge", oracle_table.get("bridge")),
-                       ("[registry].path", registry_table.get("path"))):
+                       ("[registry].path", registry_table.get("path")),
+                       ("[pull_request].body_check", pull_request_table.get("body_check"))):
         if value is not None and (not isinstance(value, str) or not value):
             raise ConfigError(f"{resolved}: {key} is not a path")
     declared = _table(resolved, document, "providers")
@@ -298,6 +316,7 @@ def load(path: str | None = None) -> Config:
             docs_index=oracle_table.get("docs_index"),
             bridge=oracle_table.get("bridge"),
             registry=registry_table.get("path"),
+            body_check=pull_request_table.get("body_check"),
             repos=repos,
             providers=providers,
         )

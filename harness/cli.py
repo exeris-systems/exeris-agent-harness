@@ -35,8 +35,8 @@ import shutil
 import sys
 import tempfile
 
-from . import (ROOT, VERSION, bridge, capture, config, drive, oracle, providers, record, registry,
-               runstate, token, ulid, worktree)
+from . import (ROOT, VERSION, bridge, capture, config, drive, oracle, pr_body, providers, record,
+               registry, runstate, token, ulid, worktree)
 # Bound here rather than used through the module, because this name is the seam: everything that
 # reaches git or the forge is constructed from it, so substituting it substitutes both halves at
 # once and a test can replace the forge while keeping git.
@@ -456,6 +456,7 @@ def cmd_open_run(args) -> int:
         values.update(_launch_values(arm, args.prompt_file))
         runstate.write_env(run_dir, values)
         _write_mcp_config(run_dir, server_config)
+        pr_body.prepare(run_dir)
 
         manifest = {
             "run_id": run_id,
@@ -566,6 +567,9 @@ AGENTS_FILE = "AGENTS.md"
 #: as one; it is what makes closing a run once observable, so that a second close cannot push a
 #: second time or ask for a second pull request.
 CLOSED = "closed.json"
+
+#: The label the template gate reads beside a `Refs:` line, on a pull request that touches an ADR.
+ADR_LABEL = "adr"
 
 #: What the oracle found, gate by gate, staged with the run and carried into no inbox. The row says
 #: which oracle judged the run and what it concluded; the gates behind that are this oracle's own
@@ -832,6 +836,12 @@ def cmd_close_run(args) -> int:
     domain = cfg.repo(repo.split("/", 1)[1]).domain
     judgement = _judged(cfg, worktree_path, domain, run_id, manifest)
 
+    # The body is composed and checked before anything is pushed: a body the organisation's gate
+    # would refuse is a pull request that should not be opened, and a branch pushed for it would be
+    # half of an action.
+    adr_touched = _adr_touched(net, worktree_path, manifest["base_sha"])
+    body = None if args.no_pr else _checked_body(cfg, run_dir, run_id, adr_touched)
+
     net.git(worktree_path, "push", "origin", f"HEAD:refs/heads/{branch}", env=environment)
 
     pull_request = None
@@ -840,13 +850,19 @@ def cmd_close_run(args) -> int:
             "title": args.title or _title(net, worktree_path, commits, run_id),
             "head": branch,
             "base": worktree.default_branch(worktree_path),
-            "body": record.pull_request_body(cfg.owner_login, run_id),
+            "body": body,
             # A draft, always. A human marks it ready, and that is the moment a person takes on
             # what the run produced; opening it ready would make the identity's own push the
             # readiness event.
             "draft": True,
         })
         pull_request = (answer or {}).get("html_url") if isinstance(answer, dict) else None
+        number = answer.get("number") if isinstance(answer, dict) else None
+        if adr_touched and isinstance(number, int):
+            # The other half of the gate's ADR rule: the `Refs:` line is in the body the check
+            # passed, and the label is what the gate reads beside it.
+            net.api(f"repos/{repo}/issues/{number}/labels", method="POST", env=environment,
+                    body={"labels": [ADR_LABEL]})
 
     visibility = _visibility(net, repo, environment)
     try:
@@ -893,6 +909,43 @@ def cmd_close_run(args) -> int:
     return EXIT_OK
 
 
+def _adr_touched(net, worktree_path: str, base: str) -> bool:
+    """Whether the run's commits touch an ADR, in the sense the template gate asks it."""
+    return pr_body.touches_adr(net.git_lines(worktree_path, "diff", "--name-only",
+                                             f"{base}..HEAD"))
+
+
+def _body_check(cfg, run_dir: str, run_id: str, adr_touched):
+    """A check of the arm's text, composed as the pull request will carry it.
+
+    `adr_touched` is a callable, so a driven run asks it of the tree as the body round found it.
+    """
+    checker = pr_body.checker(cfg.body_check_path)
+
+    def check(written: str) -> list[str]:
+        return pr_body.check(checker, pr_body.compose(written, cfg.owner_login, run_id),
+                             author=cfg.bot_login, adr_touched=adr_touched(), workdir=run_dir)
+    return check
+
+
+def _checked_body(cfg, run_dir: str, run_id: str, adr_touched: bool) -> str:
+    """The pull request's body, composed and passed by the organisation's check, or `Refused`."""
+    where = pr_body.path(run_dir)
+    written = pr_body.read(where)
+    if written is None:
+        raise Refused(f"{run_id} has no pull request body at {where}; the arm writes it there (a "
+                      f"driven run is asked for it after TRUE_DONE), or close with --no-pr")
+    try:
+        check = _body_check(cfg, run_dir, run_id, lambda: adr_touched)
+        findings = check(written)
+    except pr_body.CheckUnavailable as exc:
+        raise Refused(f"{run_id}: the pull request body cannot be checked: {exc}") from None
+    if findings:
+        raise Refused(f"{run_id}: the pull request body at {where} does not pass "
+                      f"{pr_body.CHECKER}: " + "; ".join(findings))
+    return pr_body.compose(written, cfg.owner_login, run_id)
+
+
 def _stage_drive(run_dir: str, driven: dict, run_id: str) -> None:
     """The rounds a driven run used, staged beside its row and printed.
 
@@ -904,7 +957,8 @@ def _stage_drive(run_dir: str, driven: dict, run_id: str) -> None:
                         json.dumps(staged, indent=2, sort_keys=True) + "\n")
     print(f"exeris-agent: {run_id} was driven in {staged['passes']} pass(es), "
           f"{staged['feedback_rounds']} of at most {staged['oracle_rounds']} oracle round(s); "
-          f"stopped: {staged['stopped']}")
+          f"stopped: {staged['stopped']}; body: {staged['body_stopped'] or 'not asked'} after "
+          f"{staged['body_rounds']} round(s)")
 
 
 def _drive_module(adapter: str):
@@ -1036,6 +1090,8 @@ def cmd_drive(args) -> int:
     run_dir, manifest = _open_model_run(args.run)
     if args.oracle_rounds < 0:
         raise Refused(f"--oracle-rounds {args.oracle_rounds} is not a number of rounds")
+    if args.body_rounds < 0:
+        raise Refused(f"--body-rounds {args.body_rounds} is not a number of rounds")
     if os.path.exists(os.path.join(run_dir, drive.RECORD)):
         raise Refused(f"{args.run} was driven already; a second drive would be a second session")
     adapter = manifest["provider_table"].get("adapter") or manifest["provider"]
@@ -1049,7 +1105,10 @@ def cmd_drive(args) -> int:
 
     run_id = manifest["run_id"]
     repo_config = cfg.repo(manifest["repo"].split("/", 1)[1])
-    readable = _readable(cfg, repo_config)
+    # Every pass may write the body's directory, not only the body rounds: the passes of one run
+    # differ in what they were told and never in what they were allowed.
+    body_path = pr_body.prepare(run_dir)
+    readable = [*_readable(cfg, repo_config), os.path.dirname(body_path)]
     environment = _launch_environment(run_dir, run_id)
     task_file, task_text = _task(environment, manifest)
     launcher = _launcher(adapter)
@@ -1060,16 +1119,43 @@ def cmd_drive(args) -> int:
                         task_file=task_file, task_sha256=manifest["prompt_sha256"],
                         readable=readable, max_rounds=args.oracle_rounds, mcp_config=mcp_config,
                         judge=lambda: _judged(cfg, worktree_path, repo_config.domain, run_id,
-                                              manifest))
+                                              manifest),
+                        body=_body_step(cfg, run_dir, run_id, manifest, body_path,
+                                        args.body_rounds))
     for entry in driven["rounds"]:
         print(f"exeris-agent: {run_id} round {entry['round']}: {entry['outcome']} "
               f"({entry['wall_time_ms']} ms, exit {entry['exit']})")
+    body = driven.get("body")
+    if body:
+        print(f"exeris-agent: {run_id} pull request body: {body['stopped']} after "
+              f"{len(body['rounds'])} round(s){'; ' + body['detail'] if body.get('detail') else ''}")
     refused = drive.refusal(driven)
     if refused:
         raise Refused(f"{run_id}: {refused}")
     print(f"exeris-agent: {run_id} stopped: {driven['stopped']}; close it with "
           f"`exeris-agent close-run --run {run_id}`")
     return EXIT_OK
+
+
+def _body_step(cfg, run_dir: str, run_id: str, manifest: dict, body_path: str,
+               rounds: int) -> drive.BodyStep | None:
+    """The body rounds a drive ends with, or nothing where no check is configured to judge them.
+
+    Without a check there is nothing to say the body is right, and `close-run` will open no pull
+    request for the run anyway; the drive says so rather than ask for a body nobody can check.
+    """
+    if not cfg.body_check_path:
+        print(f"exeris-agent: {run_id}: no [pull_request] body_check is configured, so no pull "
+              f"request body is asked for", file=sys.stderr)
+        return None
+    net = Runner()
+    tree = manifest["worktree"]
+    return drive.BodyStep(
+        path=body_path,
+        check=_body_check(cfg, run_dir, run_id,
+                          lambda: _adr_touched(net, tree, manifest["base_sha"])),
+        tree=lambda: (net.git(tree, "rev-parse", "HEAD"), net.git(tree, "status", "--porcelain")),
+        rounds=rounds)
 
 
 def _remove_worktree(net, worktree_path: str, dirty: bool) -> None:
@@ -1742,12 +1828,18 @@ def parser() -> argparse.ArgumentParser:
     drive_run.add_argument("--oracle-rounds", type=int, default=0, metavar="<n>",
                            help="feedback rounds allowed after the first pass; 0, the default, "
                                 "is a single pass")
+    drive_run.add_argument("--body-rounds", type=int, default=2, metavar="<n>",
+                           help="after TRUE_DONE the session is asked for the pull request's "
+                                "body; how many times the template check's findings may be sent "
+                                "back (2 by default)")
     drive_run.set_defaults(handler=cmd_drive)
 
     close_run = subcommands.add_parser(
         "close-run", help="push, open the draft pull request, write the run record",
-        description="End a run as the execution identity: push its branch, open its draft pull "
-                    "request, and stage the run record beside the session stream it references.")
+        description="End a run as the execution identity: check the pull request body the arm "
+                    "wrote against the organisation's template, push its branch, open its draft "
+                    "pull request, and stage the run record beside the session stream it "
+                    "references.")
     close_run.add_argument("--run", required=True, type=_run_id, metavar=RUN_METAVAR,
                            help="the run to close")
     close_run.add_argument("--no-pr", action="store_true",
