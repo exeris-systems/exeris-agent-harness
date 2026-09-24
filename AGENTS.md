@@ -4,7 +4,7 @@ type: reference
 visibility: public
 owning-repo: exeris-agent-harness
 status: active
-last-verified: 2026-09-22
+last-verified: 2026-09-24
 ---
 
 # exeris-agent-harness
@@ -43,7 +43,7 @@ under `harness/` and the per-vendor launchers and readers under `adapters/` that
 
 | Path | What it holds |
 | :-- | :-- |
-| [`harness/`](harness) | The commands and the seams they share: `cli.py`, `token.py`, `worktree.py`, `runner.py`, `record.py`, `oracle.py`, `drive.py`, `providers.py`, `capture.py`. |
+| [`harness/`](harness) | The commands and the seams they share: `cli.py`, `token.py`, `worktree.py`, `runner.py`, `record.py`, `oracle.py`, `drive.py`, `providers.py`, `capture.py`, `bridge.py` (the pinned Exeris MCP server), `registry.py` (a registered task's oracle inputs). The configuration keys are documented in `config.py` and in the README's *Configuration*. |
 | [`adapters/<vendor>/`](adapters) | One launcher and one session reader per vendor CLI (`claude`, `codex`, `gemini`, `antigravity`), and a headless pass where `drive` can run one — never a second place a row's fields are computed. |
 | [`bin/exeris-agent`](bin/exeris-agent) | The CLI entry point; holds no logic beyond putting the checkout on the import path. |
 | [`policy/README.md`](policy/README.md) | The map to the identity's ceiling and the organisation's rulesets — the boundary is configuration, this page points at it. |

@@ -23,6 +23,13 @@ adds::
     [oracle]
     docs_index      = "…"        # the central ADR registry a documentation checkout is judged
                                  # against, in the clone that publishes it
+    bridge          = "…"        # the Exeris MCP server's `dist/server.js`, absolute: passed to
+                                 # the oracle, pinned in each run's manifest, and the one server
+                                 # an arm with `mcp = true` is given
+
+    [registry]
+    path            = "…"        # the local clone of the private task registry; a `reg:T-NNN` run
+                                 # reads `registry/tasks/T-NNN.json` there for its oracle inputs
 
     [repos.<name>]
     path            = "…"        # the local clone, when it is not beside this checkout
@@ -30,6 +37,7 @@ adds::
     scope           = […]        # the vocabulary `--scope` is checked against
     routine         = "…"        # the routine file a run there follows, hashed into the record
     readable        = ["…"]      # directories every driven pass may read, passed as `--add-dir`
+    mcp             = false      # whether an arm working here is given the pinned bridge
 
     [providers.<name>]           # one arm: a model behind a client, under a ledger — `providers`
     …                            # owns the shape, and this module only carries the tables through
@@ -57,6 +65,18 @@ added fields at the top level is understood the same way as one that put them be
 standards the work is judged against, say. They are part of what every pass of a run there was
 allowed, so they are a property of the repository and not of the arm: two arms of one group read
 the same directories. A relative path is read beside the configuration file.
+
+`[oracle] bridge` names one server for two readers. The oracle is handed it to judge with, and an
+arm working in a repository whose table says `mcp = true` is given the same server as its context
+tools, so the instrument and the arm read one registry through one program. Its version (the
+`package.json` beside `dist/`) and its commit (where the package directory is a git checkout of its
+own) are recorded when a run opens, because a server rebuilt afterwards is a different instrument.
+
+`[registry] path` is where a registered task's own record is read from. What it contributes is the
+task's `oracle_inputs` — for the documentation oracle, the files whose bodies the task must leave as
+they were — and that is a property of the task, fixed when it was planned, not of the arm or of the
+repository. With the registry configured, a `reg:` run whose task file cannot be read does not open:
+the oracle would otherwise judge the run with less than the task said it should.
 
 A `[repos.<name>]` table is addressed by the bare repository name, and a table written as
 `owner/name` resolves to the same entry: the two spellings name one repository, and a configured
@@ -88,6 +108,10 @@ class Repo:
     scope: tuple[str, ...] = ()
     routine: str | None = None
     readable: tuple[str, ...] = ()
+    #: Whether an arm working here is given the Exeris MCP server `[oracle] bridge` pins. It is a
+    #: property of the repository for the reason `readable` is: every arm of a group reads the
+    #: same context.
+    mcp: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -108,6 +132,10 @@ class Config:
     #: for the reason the oracle itself is imported and not copied: a second registry on disk is a
     #: second answer to what is registered.
     docs_index: str | None = None
+    #: The Exeris MCP server's `dist/server.js`, where the configuration names one.
+    bridge: str | None = None
+    #: The local clone of the private task registry, where the configuration names one.
+    registry: str | None = None
     repos: dict[str, Repo] = dataclasses.field(default_factory=dict)
     #: The `[providers.<name>]` tables as the file wrote them. They are carried rather than
     #: interpreted: what an arm may declare is `providers`' own, and a second opinion here would
@@ -151,6 +179,16 @@ class Config:
         return self.beside(self.docs_index) if self.docs_index else None
 
     @property
+    def bridge_path(self) -> str | None:
+        """The Exeris MCP server's entry point, absolute, or nothing where none is configured."""
+        return self.beside(self.bridge) if self.bridge else None
+
+    @property
+    def registry_path(self) -> str | None:
+        """The task registry's clone, absolute, or nothing where none is configured."""
+        return self.beside(self.registry) if self.registry else None
+
+    @property
     def age_identity_path(self) -> str | None:
         """The age identity the key is decrypted with, absolute, or nothing when none is set."""
         return self.beside(self.age_identity) if self.age_identity else None
@@ -178,6 +216,39 @@ def _scalar(document: dict, table: dict, key: str, default=None):
     return default if isinstance(value, dict) else value
 
 
+def _repo(resolved: str, name: str, table) -> Repo:
+    """One `[repos.<name>]` table, checked."""
+    if not isinstance(table, dict):
+        raise ConfigError(f"{resolved}: [repos.{name}] is not a table")
+    scope = table.get("scope") or ()
+    if isinstance(scope, str):
+        scope = (scope,)
+    readable = table.get("readable") or ()
+    if isinstance(readable, str):
+        readable = (readable,)
+    if not all(isinstance(entry, str) and entry for entry in readable):
+        raise ConfigError(f"{resolved}: [repos.{name}].readable is not a list of paths")
+    mcp = table.get("mcp", False)
+    if not isinstance(mcp, bool):
+        raise ConfigError(f"{resolved}: [repos.{name}].mcp is not true or false")
+    return Repo(name=name,
+                path=table.get("path"),
+                domain=table.get("domain"),
+                scope=tuple(scope),
+                routine=table.get("routine"),
+                readable=tuple(readable),
+                mcp=mcp)
+
+
+def _table(resolved: str, document: dict, name: str, prefix: str = "") -> dict:
+    """`[<prefix><name>]` as a mapping, empty where the file has none, `ConfigError` where it is not
+    a table."""
+    table = document.get(name) or {}
+    if not isinstance(table, dict):
+        raise ConfigError(f"{resolved}: [{prefix}{name}] is not a table")
+    return table
+
+
 def load(path: str | None = None) -> Config:
     """Read and check the configuration. Raises `ConfigError` with the key at fault."""
     resolved = os.path.expanduser(
@@ -199,34 +270,17 @@ def load(path: str | None = None) -> Config:
     if missing:
         raise ConfigError(f"{resolved}: [github] is missing {', '.join(missing)}")
 
-    repos = {}
-    for name, table in (document.get("repos") or {}).items():
-        if not isinstance(table, dict):
-            raise ConfigError(f"{resolved}: [repos.{name}] is not a table")
-        scope = table.get("scope") or ()
-        if isinstance(scope, str):
-            scope = (scope,)
-        readable = table.get("readable") or ()
-        if isinstance(readable, str):
-            readable = (readable,)
-        if not all(isinstance(entry, str) and entry for entry in readable):
-            raise ConfigError(f"{resolved}: [repos.{name}].readable is not a list of paths")
-        repos[name] = Repo(name=name,
-                           path=table.get("path"),
-                           domain=table.get("domain"),
-                           scope=tuple(scope),
-                           routine=table.get("routine"),
-                           readable=tuple(readable))
+    repos = {name: _repo(resolved, name, table)
+             for name, table in (document.get("repos") or {}).items()}
 
-    oracle_table = document.get("oracle") or {}
-    if not isinstance(oracle_table, dict):
-        raise ConfigError(f"{resolved}: [oracle] is not a table")
-
-    providers = {}
-    for name, table in (document.get("providers") or {}).items():
-        if not isinstance(table, dict):
-            raise ConfigError(f"{resolved}: [providers.{name}] is not a table")
-        providers[name] = dict(table)
+    oracle_table, registry_table = _table(resolved, document, "oracle"), \
+        _table(resolved, document, "registry")
+    for key, value in (("[oracle].bridge", oracle_table.get("bridge")),
+                       ("[registry].path", registry_table.get("path"))):
+        if value is not None and (not isinstance(value, str) or not value):
+            raise ConfigError(f"{resolved}: {key} is not a path")
+    declared = _table(resolved, document, "providers")
+    providers = {name: dict(_table(resolved, declared, name, "providers.")) for name in declared}
 
     try:
         return Config(
@@ -242,6 +296,8 @@ def load(path: str | None = None) -> Config:
             execution_repo=_scalar(document, github, "execution_repo"),
             streams_repo=_scalar(document, github, "streams_repo"),
             docs_index=oracle_table.get("docs_index"),
+            bridge=oracle_table.get("bridge"),
+            registry=registry_table.get("path"),
             repos=repos,
             providers=providers,
         )

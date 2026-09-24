@@ -111,30 +111,46 @@ def segment(value: str) -> str:
     return _NOT_SEGMENT.sub("-", str(value).lower()).strip("-")
 
 
-def producer(adapter: str, oracle_rounds: int = 0) -> str:
-    """The producer segment of a fence id: `harness-<adapter>`, or `harness-<adapter>-oracle<N>`.
+def producer(adapter: str, oracle_rounds: int = 0, *, oracle_v2: bool = False,
+             mcp: bool = False) -> str:
+    """The producer segment of a fence id: `harness-<adapter>[-oracle<N>][-v2][-mcp]`.
 
     A run driven with the oracle in the loop is a different producer from a single pass, because
     the loop changes what a row's cost is a cost of: the rounds a pass was allowed to be told what
     still fails. `N` is the number of feedback rounds the loop was allowed, not the number it used —
     the allowance is the condition the run ran under, and the count used is its result.
+
+    `-v2` marks a row judged by the second generation of the documentation oracle, and `-mcp` a row
+    whose arm was given the Exeris MCP server as context tools. Each is a different instrument
+    state: the first changes what an outcome is an outcome of, the second what the arm could read
+    while it worked. They come in this order and only where they are true, so a producer has one
+    spelling.
     """
     if not isinstance(oracle_rounds, int) or isinstance(oracle_rounds, bool) or oracle_rounds < 0:
         raise NoRow("fence-unregistered", f"{oracle_rounds!r} is not a number of oracle rounds")
     named = f"harness-{segment(adapter)}"
-    return f"{named}-oracle{oracle_rounds}" if oracle_rounds else named
+    if oracle_rounds:
+        named += f"-oracle{oracle_rounds}"
+    if oracle_v2:
+        named += "-v2"
+    if mcp:
+        named += "-mcp"
+    return named
 
 
 def fence(execution_repo: str, provider: str, client_version: str,
-          model_snapshot: str | None = None, *, oracle_rounds: int = 0) -> str:
+          model_snapshot: str | None = None, *, oracle_rounds: int = 0, oracle_v2: bool = False,
+          mcp: bool = False) -> str:
     """The registered fence a harness row is written under, read from the register.
 
     The grammar, as the register writes it::
 
-        <date>-harness-<adapter>[-oracle<N>]-cc-<client version>[-w-<weights digest>]
+        <date>-harness-<adapter>[-oracle<N>][-v2][-mcp]-cc-<client version>[-w-<weights digest>]
 
     `-oracle<N>` is present where the run was driven with the oracle in the loop and allowed `N`
-    feedback rounds after its first pass, and absent for a single pass — see `producer`.
+    feedback rounds after its first pass, and absent for a single pass; `-v2` where the second
+    generation of the documentation oracle judged the row; `-mcp` where the arm was given the
+    Exeris MCP server — see `producer`.
 
     The id names the producer and the client version, because both are part of what a row means: a
     change to either is a change to the run's conditions, and rows either side of one are never
@@ -154,7 +170,8 @@ def fence(execution_repo: str, provider: str, client_version: str,
     resolve to one entry and rows whose model reference differs sit on one fence. A row whose
     snapshot is unresolved names no weights and keeps the shorter form: there is nothing to name.
     """
-    suffix = f"-{producer(provider, oracle_rounds)}-cc-{segment(client_version)}"
+    named = producer(provider, oracle_rounds, oracle_v2=oracle_v2, mcp=mcp)
+    suffix = f"-{named}-cc-{segment(client_version)}"
     if model_snapshot and str(model_snapshot).startswith("sha256:"):
         digested = _SNAPSHOT.match(str(model_snapshot))
         if not digested:

@@ -89,7 +89,9 @@ after it and the time the pass took — and the feedback prompts are kept beside
 because they are instrument output and not the task. `close-run` reads that record: the oracle's
 prompts are not counted in `execution.human_prompts` (a recorded one the session does not hold is a
 refusal, not a zero), the row sits on the fence `…-harness-<adapter>-oracle<N>-cc-…` for a loop
-allowed `N` rounds, and the rounds used are staged in `staging/drive.json` and printed — the row
+allowed `N` rounds (with `-v2` after it where the second generation of the documentation oracle
+judged the row, and `-mcp` after that where the arm was given the MCP server — see *The MCP server
+for the arms*), and the rounds used are staged in `staging/drive.json` and printed — the row
 has no field for them. `drive` is a command of its own rather than `open-run --drive` because
 `--launch` hands the process to the client for a person to work in, and a loop has to outlive the
 pass it launched.
@@ -173,6 +175,16 @@ docs_index      = "…"      # the central ADR registry a documentation checkout
                            # anywhere else that gate does not run, because the alternative is a
                            # gate that fetches over the network, and a gate that reports the
                            # network is not a gate
+bridge          = "…"      # the Exeris MCP server's `dist/server.js`, absolute: passed to the
+                           # oracle, pinned (package version, and commit where its package
+                           # directory is a git checkout) in every run's manifest, and the one
+                           # server an arm with `mcp = true` is given
+
+[registry]
+path            = "…"      # the local clone of the private task registry. A `reg:T-NNN` run reads
+                           # `registry/tasks/T-NNN.json` there when it opens and records the task's
+                           # `oracle_inputs.preserve`; a task file that cannot be read refuses the
+                           # run. Without it no task tells the oracle anything
 
 [repos.exeris-docs]         # the bare name; `[repos."exeris-systems/exeris-docs"]` names the
                             # same repository, so a vocabulary configured either way is enforced
@@ -186,6 +198,9 @@ routine         = "…"      # the routine a run here follows, hashed into the r
 readable        = ["…"]    # directories outside the worktree every `drive` pass may read, passed
                            # as `--add-dir`; a property of the repository, so every arm of a group
                            # reads the same ones, and a path that is not a directory is refused
+mcp             = false    # whether an arm working here is given the server `[oracle] bridge`
+                           # pins as context tools; a property of the repository for the reason
+                           # `readable` is
 ```
 
 A run against a repository the configuration says nothing about opens and closes, and yields no
@@ -215,6 +230,18 @@ row — a per-gate column is a column about one oracle's internals, not comparab
 renamed whenever a gate is — and the file carries both what the oracle concluded and what the row
 was allowed to say, because that pair is what explains a run whose gates all passed and whose row
 reads `UNKNOWN`.
+
+**Two generations.** The execution repository may publish the second generation of the
+documentation oracle beside the first, calibrated by the suite `docs-mutation-v2` in
+`oracle-selftest-v2.json`. Where that file is present it is the calibration read, and its status is
+the one the outcome rule applies; `oracle-selftest.json` is the fallback only while it is absent.
+Under the second generation the oracle is asked three things more: `base`, the commit the run
+started from; `preserve`, the task's patterns for files whose bodies must be unchanged against
+`base`; and `bridge`, the pinned MCP server. They are passed only where the second calibration is in
+force and the oracle's `judge` names them — under the first one's they are dropped, because that
+suite measured an oracle never given them. An `adhoc:` run has no task record and asks for no
+`preserve`. The suite that calibrated a judgement is on the row's `oracle.calibration.suite`, and a
+row judged by the second generation sits on a `-v2` fence.
 
 A `construction` run is still `UNKNOWN` at `not-run`. That suite has not been run as a suite, and
 an oracle whose pass has never been contradicted by a known-broken input is unvalidated.
@@ -258,6 +285,31 @@ Three rules the tables are checked against when a run opens, rather than when it
 The manifest records the arm as it was resolved, including the weights digest, and records the
 *names* of the launch variables without their values: a token read out of a file to be exported is
 a credential, and the record of a run is not where a credential is kept.
+
+### The MCP server for the arms
+
+`[repos.<name>] mcp = true` gives an arm working there the server `[oracle] bridge` pins — the
+same program the oracle reads the registry through, so the arm's context and the instrument's
+judgement come from one build. The manifest records `mcp: {server, bridge: {version, commit},
+tools}` for an arm given it and `mcp: null` for one that is not, and a row whose arm had it sits on
+a `-mcp` fence. How the server reaches the arm is the client's:
+
+- **Claude Code** takes it per invocation. `open-run` writes `<run>/mcp.json`, one stdio server
+  named `exeris` running `node <bridge>` with `EXERIS_DOCS_ROOT` set to the first `readable`
+  directory holding `adr-index.md` (none is a refusal) and `EXERIS_BRIDGE_MODE=contributor`. Every
+  `drive` pass is given `--mcp-config <run>/mcp.json --strict-mcp-config`, so no server of the
+  person's own configuration is loaded, and the server's read-only documentation tools are added
+  to the allowed tools as `mcp__exeris__docs-list_adrs`, `mcp__exeris__docs-get_adr` and
+  `mcp__exeris__docs-search` — the name Claude Code gives an MCP tool, `mcp__<server>__<tool>`,
+  keeping `-` and `_`. The configuration is given to `drive`'s passes; a person working in a run
+  opened with `--launch` works under their own client configuration.
+- **Antigravity** has no per-invocation flag: it reads its own user-level configuration. So the
+  run is checked rather than configured. With `mcp = true`, `open-run` requires `agy mcp list` to
+  show exactly one enabled stdio server whose command is `node <pinned bridge>`, records that line,
+  and otherwise refuses, naming the `agy mcp add` that points it there; with `mcp = false` it
+  refuses where any enabled server is the Exeris bridge, because the arms of a group read through
+  the same context tools. `drive` checks the listing again before its first pass. The client exposes
+  every tool the server lists, which the manifest records as `tools: ["*"]`.
 
 ### The three arms this machine runs
 

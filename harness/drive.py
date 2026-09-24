@@ -156,12 +156,14 @@ def _stop(code: int, admitted: str, number: int, max_rounds: int) -> str | None:
 
 def loop(*, adapter: str, module, launcher: str, run_dir: str, worktree: str, environment: dict,
          task_text: str, task_file: str, task_sha256: str, readable, max_rounds: int,
-         judge) -> dict:
+         judge, mcp_config: str | None = None) -> dict:
     """Run passes until the oracle admits an outcome other than `FALSE_DONE`, or the rounds end.
 
     `max_rounds` is how many feedback rounds may follow the first pass; `0` is a single pass.
-    `judge` answers the oracle's judgement of the tree as it stands. Answers the record, which is
-    also on disk; a record whose `stopped` is one of `REFUSALS` is a loop that was refused.
+    `judge` answers the oracle's judgement of the tree as it stands. `mcp_config` is the run's MCP
+    configuration, where its arm was given one, and every pass is given the same. Answers the
+    record, which is also on disk; a record whose `stopped` is one of `REFUSALS` is a loop that
+    was refused.
     """
     os.makedirs(os.path.join(run_dir, DIRECTORY), mode=runstate.DIR_MODE, exist_ok=True)
     record = {"adapter": adapter, "oracle_rounds": max_rounds, "rounds": [], "stopped": None}
@@ -170,7 +172,8 @@ def loop(*, adapter: str, module, launcher: str, run_dir: str, worktree: str, en
     number = 0
     while True:
         number += 1
-        argv = [launcher, *module.arguments(readable=readable, resume=resume)]
+        argv = [launcher, *module.arguments(readable=readable, resume=resume,
+                                            mcp_config=mcp_config)]
         env, prompt = _prompt_route(module, environment, prompt_text, prompt_file)
         started = time.monotonic()
         code, stdout = run_pass(argv, cwd=worktree, env=env, prompt=prompt,

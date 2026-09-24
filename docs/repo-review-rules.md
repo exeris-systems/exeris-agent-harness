@@ -4,7 +4,7 @@ type: reference
 visibility: public
 owning-repo: exeris-agent-harness
 status: active
-last-verified: 2026-09-22
+last-verified: 2026-09-24
 ---
 
 # Review rules for `exeris-agent-harness`
@@ -57,8 +57,10 @@ H5. **A list of arms is configuration, never a recommendation** (ADR-086 Enginee
 H6. **The oracle is imported, never copied, and its outcome is written only under a calibration
     that passed.** The docs oracle is read from the execution repository's clone, where it is
     published and calibrated; a second implementation of a gate here → `[HARD BLOCK]`. A change that
-    writes `TRUE_DONE` or `FALSE_DONE` to a row without reading `oracle-selftest.json` at
-    `status: pass`, or that reads the outcome from anything but the oracle → `[HARD BLOCK]`.
+    writes `TRUE_DONE` or `FALSE_DONE` to a row without reading the calibration in force at
+    `status: pass` — `oracle-selftest-v2.json` where the execution repository publishes it,
+    `oracle-selftest.json` only where it does not — or that reads the outcome from anything but the
+    oracle → `[HARD BLOCK]`.
 
 H7. **A rule arrives with a case that can fail, and the body's count matches the suite.** A change
     to `harness/` or `adapters/` that adds or alters a refusal, a derivation or a boundary without

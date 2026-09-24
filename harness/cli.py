@@ -35,8 +35,8 @@ import shutil
 import sys
 import tempfile
 
-from . import (ROOT, VERSION, capture, config, drive, oracle, providers, record, runstate, token,
-               ulid, worktree)
+from . import (ROOT, VERSION, bridge, capture, config, drive, oracle, providers, record, registry,
+               runstate, token, ulid, worktree)
 # Bound here rather than used through the module, because this name is the seam: everything that
 # reaches git or the forge is constructed from it, so substituting it substitutes both halves at
 # once and a test can replace the forge while keeping git.
@@ -294,6 +294,101 @@ def _launch_values(arm, prompt_file: str | None) -> dict:
     return values
 
 
+#: The one-server MCP configuration an arm whose client takes one per invocation is given, inside
+#: the run's directory.
+MCP_FILE = "mcp.json"
+
+#: How an adapter's client is given an MCP server, as its drive module's `MCP_ROUTE` names it: a
+#: configuration file per invocation, or the client's own user-level configuration.
+MCP_BY_CONFIG = "config"
+MCP_BY_USER = "user"
+
+#: Where the manifest records what MCP server the arm was given, `None` for none.
+MCP_KEY = "mcp"
+
+#: Where an arm checked against its client's own configuration records the server line it found.
+OBSERVED = "observed"
+
+
+def _oracle_inputs(cfg, task: str) -> dict | None:
+    """What a registered task tells the oracle, read from the registry where one is configured.
+
+    Nothing for an `adhoc:` run, which has no task record, and nothing where no registry is
+    configured. A configured registry that cannot answer for a `reg:` task refuses the run: it
+    would otherwise be judged with less than its task said.
+    """
+    if not cfg.registry_path or not task.startswith(registry.PREFIX):
+        return None
+    try:
+        return registry.oracle_inputs(cfg.registry_path, task)
+    except registry.RegistryError as exc:
+        raise Refused(f"{exc}; [registry] path is configured, and a registered run is judged with "
+                      f"what its task says or is not opened") from None
+
+
+def _bridge_pin(cfg) -> dict | None:
+    """The configured Exeris MCP server, pinned, or nothing where none is configured."""
+    if not cfg.bridge_path:
+        return None
+    try:
+        return bridge.pin(cfg.bridge_path)
+    except bridge.BridgeError as exc:
+        raise Refused(str(exc)) from None
+
+
+def _user_mcp(module, pinned_path: str | None, *, enabled: bool) -> str | None:
+    """The client's own configured server line, checked against what the arm is given."""
+    try:
+        return module.mcp_state(pinned_path, enabled=enabled)
+    except module.McpRefused as exc:
+        raise Refused(str(exc)) from None
+
+
+def _arm_mcp(cfg, repo_config, adapter: str,
+             pinned: dict | None) -> tuple[dict | None, dict | None]:
+    """`(manifest record, MCP configuration to write)` for the arm, or `Refused`.
+
+    An arm whose repository says `mcp = true` is given the pinned server: a client that takes a
+    configuration per invocation gets one written for it, and a client that reads its own has that
+    configuration checked. An arm not given it is held to having none of the bridge, where its
+    client's own configuration could supply one.
+    """
+    module = _drive_module(adapter)
+    route = getattr(module, "MCP_ROUTE", None)
+    if not repo_config.mcp:
+        if route == MCP_BY_USER:
+            _user_mcp(module, bridge.path_of(pinned), enabled=False)
+        return None, None
+    if not pinned:
+        raise Refused(f"[repos.{repo_config.name}] sets mcp = true and [oracle] bridge names no "
+                      f"server to give the arm")
+    if route not in (MCP_BY_CONFIG, MCP_BY_USER):
+        raise Refused(f"[repos.{repo_config.name}] sets mcp = true and the {adapter} adapter "
+                      f"has no way to give its client an MCP server")
+    record_of = {"server": bridge.SERVER, bridge.MANIFEST_KEY: bridge.recorded(pinned),
+                 "tools": list(module.MCP_TOOLS)}
+    if route == MCP_BY_USER:
+        record_of[OBSERVED] = _user_mcp(module, bridge.path_of(pinned), enabled=True)
+        return record_of, None
+    root = bridge.docs_root(_readable(cfg, repo_config))
+    if root is None:
+        raise Refused(f"[repos.{repo_config.name}] sets mcp = true and none of its readable "
+                      f"directories holds {bridge.DOCS_INDEX}, so the server has no documents "
+                      f"to serve")
+    return record_of, bridge.server_config(bridge.path_of(pinned), root)
+
+
+def _write_mcp_config(run_dir: str, server_config: dict | None) -> None:
+    if server_config:
+        runstate.write_text(run_dir, MCP_FILE,
+                            json.dumps(server_config, indent=2, sort_keys=True) + "\n")
+
+
+def _present(**fields) -> dict:
+    """The fields that hold something — a manifest carries no key for a fact a run did not have."""
+    return {key: value for key, value in fields.items() if value}
+
+
 def cmd_open_run(args) -> int:
     cfg = config.load()
 
@@ -306,9 +401,13 @@ def cmd_open_run(args) -> int:
     prompt_sha256 = _prompt_digest(args.prompt_file)
     clone = worktree.resolve_clone(args.repo, cfg)
     slug = worktree.origin_slug(clone)
-    scope = _scope(args, cfg.repo(slug.split("/", 1)[1]))
+    repo_config = cfg.repo(slug.split("/", 1)[1])
+    scope = _scope(args, repo_config)
     base_branch = worktree.default_branch(clone)
     launcher = _launcher(arm.adapter) if args.launch else None
+    oracle_inputs = _oracle_inputs(cfg, args.task)
+    pinned = _bridge_pin(cfg)
+    mcp, server_config = _arm_mcp(cfg, repo_config, arm.adapter, pinned)
 
     # A pull request this run's work becomes carries exactly one `Owner:`, naming the member
     # accountable for it. The manifest is where that line will be built from, so a configuration
@@ -356,6 +455,7 @@ def cmd_open_run(args) -> int:
         # order below is a statement rather than a precedence.
         values.update(_launch_values(arm, args.prompt_file))
         runstate.write_env(run_dir, values)
+        _write_mcp_config(run_dir, server_config)
 
         manifest = {
             "run_id": run_id,
@@ -380,13 +480,16 @@ def cmd_open_run(args) -> int:
             # removed.
             "cwd_slug": tree.replace("/", "-").replace(".", "-"),
             "harness": {"client": "exeris-agent-harness", "version": VERSION},
+            # Whether the arm was given the Exeris MCP server, and which build: recorded for every
+            # arm, `None` for one given none, because the fence a row sits on reads it.
+            MCP_KEY: mcp,
         }
-        if pairing:
-            manifest["pairing"] = pairing
-        if prompt_sha256:
-            manifest["prompt_sha256"] = prompt_sha256
-        if human_baseline:
-            manifest["human_baseline"] = dict(human_baseline)
+        # What the task tells the oracle and which server the oracle reads through, fixed when
+        # the run opens: a registry edited or a server rebuilt afterwards would change the
+        # instrument in the middle of the run.
+        manifest.update(_present(pairing=pairing, prompt_sha256=prompt_sha256,
+                                 human_baseline=dict(human_baseline or {}),
+                                 oracle_inputs=oracle_inputs, bridge=pinned))
         runstate.write_manifest(run_dir, manifest)
     except BaseException:
         runstate.discard(run_dir)
@@ -471,19 +574,30 @@ CLOSED = "closed.json"
 JUDGEMENT_FILE = "judgement.json"
 
 
-def _judged(cfg, worktree_path: str, domain: str, run_id: str) -> dict:
+def _judged(cfg, worktree_path: str, domain: str, run_id: str, manifest: dict) -> dict:
     """Ask the seam, and say beside the run what it could not read.
 
     The judge is given paths and never the configuration, so that what an oracle is shown is
-    visible at the call. Anything it could not read is printed rather than swallowed: `UNKNOWN`
-    because no oracle was there and `UNKNOWN` because the gates found nothing to judge are the
-    same word on the row, and the difference is a person's to act on.
+    visible at the call. What the task tells the oracle and the server it reads through are the
+    ones the run recorded when it opened, and the commit the run started from is the base its
+    `preserve` patterns are compared against. Anything it could not read is printed rather than
+    swallowed: `UNKNOWN` because no oracle was there and `UNKNOWN` because the gates found nothing
+    to judge are the same word on the row, and the difference is a person's to act on.
     """
+    inputs = manifest.get("oracle_inputs") or {}
+    pinned = manifest.get(bridge.MANIFEST_KEY) or {}
     judgement = oracle.judge(worktree_path, domain or "",
                              execution_repo=cfg.execution_repo_path,
-                             index=cfg.docs_index_path)
+                             index=cfg.docs_index_path,
+                             base=manifest.get("base_sha") if inputs else None,
+                             preserve=tuple(inputs.get("preserve") or ()),
+                             bridge=bridge.path_of(pinned))
     if judgement.get("reason"):
         print(f"exeris-agent: {run_id}: {judgement['reason']}", file=sys.stderr)
+    reported = judgement.get(oracle.BRIDGE)
+    if reported and pinned and reported != bridge.recorded(pinned):
+        print(f"exeris-agent: {run_id}: the oracle read through bridge {reported} and the run "
+              f"pinned {bridge.recorded(pinned)}", file=sys.stderr)
     return judgement
 
 
@@ -641,7 +755,9 @@ def _row(args, cfg, net, manifest, *, worktree_path, visibility, dirty, commits,
             fence=record.fence(cfg.execution_repo_path or "", adapter,
                                arm.get("harness_version") or facts["version"],
                                arm.get("model_snapshot"),
-                               oracle_rounds=drive.oracle_rounds(driven)),
+                               oracle_rounds=drive.oracle_rounds(driven),
+                               oracle_v2=oracle.second_generation(judgement),
+                               mcp=bool(manifest.get(MCP_KEY))),
             ref=record.stream_ref(cfg.org, os.path.basename(cfg.streams_repo_path or ""), date,
                                   manifest["repo"].split("/", 1)[1], manifest["run_id"]),
             # The prompt as it was passed, where the run was given one, and otherwise the prompt
@@ -714,7 +830,7 @@ def cmd_close_run(args) -> int:
     # after a push would still be honest, and one taken after a merge or a rebase would not be, and
     # the order is what keeps that from ever being a question.
     domain = cfg.repo(repo.split("/", 1)[1]).domain
-    judgement = _judged(cfg, worktree_path, domain, run_id)
+    judgement = _judged(cfg, worktree_path, domain, run_id, manifest)
 
     net.git(worktree_path, "push", "origin", f"HEAD:refs/heads/{branch}", env=environment)
 
@@ -888,6 +1004,32 @@ def _tree_of(run_dir: str, worktree_path) -> bool:
     return inside and os.path.isdir(real)
 
 
+def _mcp_config(module, run_dir: str, manifest: dict) -> str | None:
+    """The MCP configuration a pass is given, checked against what the run recorded when it opened.
+
+    A client that takes one per invocation is given the file `open-run` wrote, and one that reads
+    its own configuration has that configuration checked again, because it can have been edited
+    between the run opening and the pass starting.
+    """
+    given = manifest.get(MCP_KEY) or {}
+    route = getattr(module, "MCP_ROUTE", None)
+    if route == MCP_BY_USER:
+        observed = _user_mcp(module, bridge.path_of(manifest.get(bridge.MANIFEST_KEY)),
+                             enabled=bool(given))
+        opened_with = given.get(OBSERVED)
+        if given and observed != opened_with:
+            raise Refused(f"agy's own MCP configuration now lists {observed!r} and the run opened "
+                          f"with {opened_with!r}")
+        return None
+    if not given:
+        return None
+    path = os.path.join(run_dir, MCP_FILE)
+    if route != MCP_BY_CONFIG or not os.path.isfile(path):
+        raise Refused(f"run {manifest['run_id']} was opened with an MCP server and has no "
+                      f"configuration to give its passes: {path}")
+    return path
+
+
 def cmd_drive(args) -> int:
     """Run the arm headlessly in the run's tree, with the oracle judging after every pass."""
     cfg = config.load()
@@ -911,12 +1053,14 @@ def cmd_drive(args) -> int:
     environment = _launch_environment(run_dir, run_id)
     task_file, task_text = _task(environment, manifest)
     launcher = _launcher(adapter)
+    mcp_config = _mcp_config(module, run_dir, manifest)
 
     driven = drive.loop(adapter=adapter, module=module, launcher=launcher, run_dir=run_dir,
                         worktree=worktree_path, environment=environment, task_text=task_text,
                         task_file=task_file, task_sha256=manifest["prompt_sha256"],
-                        readable=readable, max_rounds=args.oracle_rounds,
-                        judge=lambda: _judged(cfg, worktree_path, repo_config.domain, run_id))
+                        readable=readable, max_rounds=args.oracle_rounds, mcp_config=mcp_config,
+                        judge=lambda: _judged(cfg, worktree_path, repo_config.domain, run_id,
+                                              manifest))
     for entry in driven["rounds"]:
         print(f"exeris-agent: {run_id} round {entry['round']}: {entry['outcome']} "
               f"({entry['wall_time_ms']} ms, exit {entry['exit']})")
@@ -999,6 +1143,9 @@ def _open_baseline(args) -> int:
     repo_config = cfg.repo(slug.split("/", 1)[1])
     scope = _scope(args, repo_config)
     base_branch = worktree.default_branch(clone)
+    # The human arm is judged with what its task tells the oracle, through the same server, for
+    # the reason it is judged by the same oracle at all.
+    judged_with = _present(oracle_inputs=_oracle_inputs(cfg, task), bridge=_bridge_pin(cfg))
 
     run_id = ulid.new()
     run_dir = runstate.create(run_id)
@@ -1025,6 +1172,7 @@ def _open_baseline(args) -> int:
             "branch": branch,
             "base_sha": base_sha,
             "harness": {"client": "exeris-agent-harness", "version": VERSION},
+            **judged_with,
         })
     except BaseException:
         runstate.discard(run_dir)
@@ -1068,7 +1216,7 @@ def _close_baseline(args) -> int:
     # tree. A baseline judged by anything else is not a baseline: the comparison it exists for is a
     # comparison of outcomes, and two arms measured by two instruments compare the instruments.
     domain = manifest.get("domain") or ""
-    judgement = _judged(config.load(), worktree_path, domain, args.run)
+    judgement = _judged(config.load(), worktree_path, domain, args.run, manifest)
     _stage_judgement(run_dir, judgement, run_id=args.run, domain=domain)
     baseline = {"wall_time_ms": wall_time_ms, "outcome": oracle.outcome_of(judgement)}
     changes = _changes(net, worktree_path, manifest["base_sha"])
