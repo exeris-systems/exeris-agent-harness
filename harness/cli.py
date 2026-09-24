@@ -1114,10 +1114,12 @@ def cmd_drive(args) -> int:
     launcher = _launcher(adapter)
     mcp_config = _mcp_config(module, run_dir, manifest)
 
-    driven = drive.loop(adapter=adapter, module=module, launcher=launcher, run_dir=run_dir,
-                        worktree=worktree_path, environment=environment, task_text=task_text,
+    passes = drive.Passes(module=module, launcher=launcher, run_dir=run_dir,
+                          worktree=worktree_path, environment=environment,
+                          readable=tuple(readable), mcp_config=mcp_config)
+    driven = drive.loop(adapter=adapter, passes=passes, task_text=task_text,
                         task_file=task_file, task_sha256=manifest["prompt_sha256"],
-                        readable=readable, max_rounds=args.oracle_rounds, mcp_config=mcp_config,
+                        max_rounds=args.oracle_rounds,
                         judge=lambda: _judged(cfg, worktree_path, repo_config.domain, run_id,
                                               manifest),
                         body=_body_step(cfg, run_dir, run_id, manifest, body_path,

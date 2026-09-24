@@ -40,6 +40,7 @@ import os
 import re
 import subprocess
 import time
+from collections.abc import Callable
 
 from . import oracle, pr_body, runstate
 from .capture import NoRow
@@ -99,8 +100,8 @@ class BodyStep:
     """
 
     path: str
-    check: object
-    tree: object
+    check: Callable[[str], list[str]]
+    tree: Callable[[], object]
     rounds: int
 
 
@@ -184,17 +185,49 @@ def _stop(code: int, admitted: str, number: int, max_rounds: int) -> str | None:
     return None
 
 
-def loop(*, adapter: str, module, launcher: str, run_dir: str, worktree: str, environment: dict,
-         task_text: str, task_file: str, task_sha256: str, readable, max_rounds: int,
-         judge, mcp_config: str | None = None, body: BodyStep | None = None) -> dict:
+@dataclasses.dataclass(frozen=True)
+class Passes:
+    """What every pass of one run is started with: the same client, tree, environment and powers.
+
+    Held together because it is one fact — a run's passes differ in what they are told and in
+    which session they resume, and in nothing here.
+    """
+
+    module: object
+    launcher: str
+    run_dir: str
+    worktree: str
+    environment: dict
+    readable: tuple
+    mcp_config: str | None = None
+
+    def run(self, number: int, resume: str | None, text: str,
+            prompt_file: str) -> tuple[int, str, int]:
+        """One pass: `(exit status, standard output, wall time in milliseconds)`."""
+        argv = [self.launcher, *self.module.arguments(readable=self.readable, resume=resume,
+                                                      mcp_config=self.mcp_config)]
+        env, prompt = _prompt_route(self.module, self.environment, text, prompt_file)
+        started = time.monotonic()
+        code, stdout = run_pass(argv, cwd=self.worktree, env=env, prompt=prompt,
+                                stderr_path=os.path.join(self.run_dir, DIRECTORY,
+                                                         f"round-{number}.stderr"))
+        return code, stdout, int((time.monotonic() - started) * 1000)
+
+    def session(self, stdout: str) -> str | None:
+        """The session a pass that printed `stdout` ran in, as its adapter reads it."""
+        return self.module.resume_id(Answer(stdout=stdout, run_dir=self.run_dir))
+
+
+def loop(*, adapter: str, passes: Passes, task_text: str, task_file: str, task_sha256: str,
+         max_rounds: int, judge, body: BodyStep | None = None) -> dict:
     """Run passes until the oracle admits an outcome other than `FALSE_DONE`, or the rounds end.
 
     `max_rounds` is how many feedback rounds may follow the first pass; `0` is a single pass.
-    `judge` answers the oracle's judgement of the tree as it stands. `mcp_config` is the run's MCP
-    configuration, where its arm was given one, and every pass is given the same. `body`, where
-    given, is the step asked for once the loop stops at `TRUE_DONE`. Answers the record, which is
-    also on disk; a record whose `stopped` is one of `REFUSALS` is a loop that was refused.
+    `judge` answers the oracle's judgement of the tree as it stands. `body`, where given, is the
+    step asked for once the loop stops at `TRUE_DONE`. Answers the record, which is also on disk; a
+    record whose `stopped` is one of `REFUSALS` is a loop that was refused.
     """
+    run_dir = passes.run_dir
     os.makedirs(os.path.join(run_dir, DIRECTORY), mode=runstate.DIR_MODE, exist_ok=True)
     record = {"adapter": adapter, "oracle_rounds": max_rounds, "rounds": [], "stopped": None}
     prompt_text, prompt_file, prompt_sha256 = task_text, task_file, task_sha256
@@ -202,15 +235,7 @@ def loop(*, adapter: str, module, launcher: str, run_dir: str, worktree: str, en
     number = 0
     while True:
         number += 1
-        argv = [launcher, *module.arguments(readable=readable, resume=resume,
-                                            mcp_config=mcp_config)]
-        env, prompt = _prompt_route(module, environment, prompt_text, prompt_file)
-        started = time.monotonic()
-        code, stdout = run_pass(argv, cwd=worktree, env=env, prompt=prompt,
-                                stderr_path=os.path.join(run_dir, DIRECTORY,
-                                                         f"round-{number}.stderr"))
-        wall_time_ms = int((time.monotonic() - started) * 1000)
-
+        code, stdout, wall_time_ms = passes.run(number, resume, prompt_text, prompt_file)
         judgement = judge()
         admitted = oracle.outcome_of(judgement)
         record["rounds"].append({"round": number, "prompt_sha256": prompt_sha256,
@@ -219,7 +244,7 @@ def loop(*, adapter: str, module, launcher: str, run_dir: str, worktree: str, en
         record["stopped"] = _stop(code, admitted, number, max_rounds)
         if record["stopped"] is None:
             record["stopped"], resume, prompt_file, prompt_text = _next(
-                module, run_dir, stdout, resume, number + 1, judgement)
+                passes, stdout, resume, number + 1, judgement)
             prompt_sha256 = digest(prompt_text) if prompt_text is not None else None
         if resume and not record["stopped"]:
             record["session"] = resume
@@ -228,10 +253,8 @@ def loop(*, adapter: str, module, launcher: str, run_dir: str, worktree: str, en
             break
     if body is not None and record["stopped"] == BODY_AFTER:
         before = body.tree()
-        record["body"] = _body_rounds(module, launcher=launcher, run_dir=run_dir,
-                                      worktree=worktree, environment=environment,
-                                      readable=readable, mcp_config=mcp_config, stdout=stdout,
-                                      resumed=resume, number=number, body=body)
+        record["body"] = _body_rounds(passes, stdout=stdout, resumed=resume, number=number,
+                                      body=body)
         if body.tree() != before:
             record["body"]["tree_moved"] = True
             record["stopped"] = oracle.outcome_of(judge())
@@ -239,8 +262,7 @@ def loop(*, adapter: str, module, launcher: str, run_dir: str, worktree: str, en
     return record
 
 
-def _body_rounds(module, *, launcher: str, run_dir: str, worktree: str, environment: dict,
-                 readable, mcp_config, stdout: str, resumed: str | None, number: int,
+def _body_rounds(passes: Passes, *, stdout: str, resumed: str | None, number: int,
                  body: BodyStep) -> dict:
     """The body rounds, resumed in the session the oracle's rounds ran in.
 
@@ -248,50 +270,47 @@ def _body_rounds(module, *, launcher: str, run_dir: str, worktree: str, environm
     after the first sends the check's findings on the previous one's file.
     """
     out = {"rounds": [], "stopped": None}
-    session = module.resume_id(Answer(stdout=stdout, run_dir=run_dir))
-    if not session:
-        out["stopped"] = RESUME_UNAVAILABLE
-        return out
-    if resumed and session != resumed:
-        out["stopped"] = SESSION_CHANGED
+    session = passes.session(stdout)
+    if not session or (resumed and session != resumed):
+        out["stopped"] = SESSION_CHANGED if session else RESUME_UNAVAILABLE
         return out
     text = pr_body.request(body.path)
     for attempt in range(body.rounds + 1):
         number += 1
-        prompt_file = runstate.write_text(run_dir, os.path.join(DIRECTORY,
-                                                                f"round-{number}.prompt"), text)
-        argv = [launcher, *module.arguments(readable=readable, resume=session,
-                                            mcp_config=mcp_config)]
-        env, prompt = _prompt_route(module, environment, text, prompt_file)
-        started = time.monotonic()
-        code, answered = run_pass(argv, cwd=worktree, env=env, prompt=prompt,
-                                  stderr_path=os.path.join(run_dir, DIRECTORY,
-                                                           f"round-{number}.stderr"))
+        prompt_file = runstate.write_text(passes.run_dir,
+                                          os.path.join(DIRECTORY, f"round-{number}.prompt"), text)
+        code, answered, wall_time_ms = passes.run(number, session, text, prompt_file)
         entry = {"round": number, "prompt_sha256": digest(text), "exit": code,
-                 "wall_time_ms": int((time.monotonic() - started) * 1000)}
+                 "wall_time_ms": wall_time_ms}
         out["rounds"].append(entry)
-        if code != 0:
-            out["stopped"] = PASS_FAILED
+        if code != 0 or passes.session(answered) != session:
+            out["stopped"] = PASS_FAILED if code != 0 else SESSION_CHANGED
             return out
-        if module.resume_id(Answer(stdout=answered, run_dir=run_dir)) != session:
-            out["stopped"] = SESSION_CHANGED
-            return out
-        written = pr_body.read(body.path)
-        try:
-            findings = (body.check(written) if written is not None
-                        else [BODY_ABSENT.format(path=body.path)])
-        except pr_body.CheckUnavailable as exc:
-            out["stopped"], out["detail"] = BODY_UNCHECKED, str(exc)
+        findings = _body_findings(body, out)
+        if findings is None:
             return out
         entry["findings"] = len(findings)
         if not findings:
             out["stopped"] = BODY_VALID
-            out["sha256"] = digest(written)
+            out["sha256"] = digest(pr_body.read(body.path))
             return out
         if attempt < body.rounds:
             text = pr_body.feedback(body.path, findings)
     out["stopped"] = EXHAUSTED
     return out
+
+
+def _body_findings(body: BodyStep, out: dict) -> list[str] | None:
+    """The check's findings on the body as the arm left it; nothing, with `out` stopped, where the
+    check could not be run."""
+    written = pr_body.read(body.path)
+    if written is None:
+        return [BODY_ABSENT.format(path=body.path)]
+    try:
+        return body.check(written)
+    except pr_body.CheckUnavailable as exc:
+        out["stopped"], out["detail"] = BODY_UNCHECKED, str(exc)
+        return None
 
 
 def _prompt_route(module, environment: dict, prompt_text: str,
@@ -311,13 +330,13 @@ def _prompt_route(module, environment: dict, prompt_text: str,
     raise ValueError(f"{module.__name__} names no prompt route: {module.PROMPT!r}")
 
 
-def _next(module, run_dir: str, stdout: str, resumed: str | None, number: int, judgement: dict):
+def _next(passes: Passes, stdout: str, resumed: str | None, number: int, judgement: dict):
     """`(stopped, session, prompt file, prompt text)` for the round after this one.
 
     Refused where the client named no session to continue, named a different one from the session
     this pass resumed, or where the judgement has no failing gate to say anything about.
     """
-    session = module.resume_id(Answer(stdout=stdout, run_dir=run_dir))
+    session = passes.session(stdout)
     if not session:
         return RESUME_UNAVAILABLE, None, None, None
     if resumed and session != resumed:
@@ -325,7 +344,8 @@ def _next(module, run_dir: str, stdout: str, resumed: str | None, number: int, j
     text = feedback(judgement.get("gates"))
     if text is None:
         return NO_FAILING_GATE, None, None, None
-    path = runstate.write_text(run_dir, os.path.join(DIRECTORY, f"round-{number}.prompt"), text)
+    path = runstate.write_text(passes.run_dir, os.path.join(DIRECTORY, f"round-{number}.prompt"),
+                               text)
     return None, session, path, text
 
 
