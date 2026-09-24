@@ -277,27 +277,36 @@ def _body_rounds(passes: Passes, *, stdout: str, resumed: str | None, number: in
     text = pr_body.request(body.path)
     for attempt in range(body.rounds + 1):
         number += 1
-        prompt_file = runstate.write_text(passes.run_dir,
-                                          os.path.join(DIRECTORY, f"round-{number}.prompt"), text)
-        code, answered, wall_time_ms = passes.run(number, session, text, prompt_file)
-        entry = {"round": number, "prompt_sha256": digest(text), "exit": code,
-                 "wall_time_ms": wall_time_ms}
-        out["rounds"].append(entry)
-        if code != 0 or passes.session(answered) != session:
-            out["stopped"] = PASS_FAILED if code != 0 else SESSION_CHANGED
-            return out
-        findings = _body_findings(body, out)
-        if findings is None:
-            return out
-        entry["findings"] = len(findings)
-        if not findings:
-            out["stopped"] = BODY_VALID
-            out["sha256"] = digest(pr_body.read(body.path))
+        findings = _body_round(passes, body, out, number=number, session=session, text=text)
+        if out["stopped"]:
             return out
         if attempt < body.rounds:
             text = pr_body.feedback(body.path, findings)
     out["stopped"] = EXHAUSTED
     return out
+
+
+def _body_round(passes: Passes, body: BodyStep, out: dict, *, number: int, session: str,
+                text: str) -> list[str]:
+    """One body round, recorded in `out`: the check's findings, with `out` stopped where the round
+    ended the body step — a failed pass, another session, a check that could not run, or a pass."""
+    prompt_file = runstate.write_text(passes.run_dir,
+                                      os.path.join(DIRECTORY, f"round-{number}.prompt"), text)
+    code, answered, wall_time_ms = passes.run(number, session, text, prompt_file)
+    entry = {"round": number, "prompt_sha256": digest(text), "exit": code,
+             "wall_time_ms": wall_time_ms}
+    out["rounds"].append(entry)
+    if code != 0 or passes.session(answered) != session:
+        out["stopped"] = PASS_FAILED if code != 0 else SESSION_CHANGED
+        return []
+    findings = _body_findings(body, out)
+    if findings is None:
+        return []
+    entry["findings"] = len(findings)
+    if not findings:
+        out["stopped"] = BODY_VALID
+        out["sha256"] = digest(pr_body.read(body.path))
+    return findings
 
 
 def _body_findings(body: BodyStep, out: dict) -> list[str] | None:
