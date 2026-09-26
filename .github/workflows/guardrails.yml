@@ -13,10 +13,20 @@ name: guardrails
 on:
   pull_request:
     types: [opened, edited, synchronize, ready_for_review, labeled, unlabeled, closed]
+  # A person's approval is a human review, and it reaches the required check as an event of its
+  # own: the check is read from the newest run on the head commit, so an approval no run follows
+  # greens nothing. `dismissed` because withdrawing one has to turn the check back. The model does
+  # not start on either.
+  pull_request_review:
+    types: [submitted, dismissed]
 
 concurrency:
   group: guardrails-${{ github.event.pull_request.number }}
-  cancel-in-progress: ${{ github.event.action != 'closed' && !endsWith(github.actor, '[bot]') }}
+  # A review changes no diff, so a run it starts queues behind the one already working rather than
+  # cancelling it; so does a close, and so does a bot's label.
+  cancel-in-progress: >-
+    ${{ github.event.action != 'closed' && github.event_name != 'pull_request_review'
+        && !endsWith(github.actor, '[bot]') }}
 
 permissions:
   contents: read
@@ -45,13 +55,17 @@ jobs:
   # the verdict is red and red when no verdict exists, so a pull request is never green by the
   # absence of a review. `repo-routine` is this repository's own step of the review and
   # `repo-checks` is what the reviewer reads as REPOSITORY CHECK OUTPUT — the whole unit suite,
-  # because a rule of this repository is a rule with a case that can fail.
+  # because a rule of this repository is a rule with a case that can fail. The routine runs in
+  # parts, one model run each, composed into one verdict: `pr` and `repo` on every pull request
+  # (the suite runs in the `repo` leg alone), the others where the diff has their files. A part
+  # that leaves no verdict makes the check red.
   docs-review:
     needs: [docs, commits, pr-body]
     if: ${{ always() && github.event.action != 'closed' }}
     uses: exeris-systems/.github/.github/workflows/docs-review.yml@main
     with:
       publish: true
+      review-in-parts: true
       l1-results: >-
         {"docs-lint": "${{ needs.docs.result }}",
          "commit-lint": "${{ needs.commits.result }}",
