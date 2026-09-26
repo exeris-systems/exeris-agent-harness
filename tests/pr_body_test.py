@@ -210,6 +210,16 @@ class DrivenBodyTest(drive_test.DriveFixture):
             self.assertEqual(2, self.cli(["close-run", "--run", self.run_id()]))
         self.assertEqual([], self.posted_pulls())
 
+    def test_a_negative_number_of_body_rounds_is_refused_before_any_pass(self):
+        self.open_driven()
+        said = io.StringIO()
+        with contextlib.redirect_stderr(said), contextlib.redirect_stdout(io.StringIO()):
+            code = self.cli(["drive", "--run", self.run_id(), "--oracle-rounds", "0",
+                             "--body-rounds", "-1"])
+        self.assertEqual(2, code)
+        self.assertIn("--body-rounds -1 is not a number of rounds", said.getvalue())
+        self.assertEqual([], self.passes)
+
     def test_a_run_that_is_not_true_done_is_not_asked_for_a_body(self):
         self.script = [drive_test._judgement("FALSE_DONE")]
         self.open_driven()

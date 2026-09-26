@@ -258,8 +258,10 @@ def _repo(resolved: str, name: str, table) -> Repo:
 
 def _table(resolved: str, document: dict, name: str, prefix: str = "") -> dict:
     """`[<prefix><name>]` as a mapping, empty where the file has none, `ConfigError` where it is not
-    a table."""
-    table = document.get(name) or {}
+    a table — a falsy value included: `false` where a table belongs is a mistake, not an absence."""
+    if name not in document:
+        return {}
+    table = document[name]
     if not isinstance(table, dict):
         raise ConfigError(f"{resolved}: [{prefix}{name}] is not a table")
     return table

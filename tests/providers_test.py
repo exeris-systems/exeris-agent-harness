@@ -114,6 +114,15 @@ class ProvidersTest(support.HarnessFixture):
             providers.resolve(cfg, "local-arm")
         self.assertIn("credentials", str(refusal.exception))
 
+    def test_a_provider_that_is_not_a_table_is_refused_even_when_falsy(self):
+        for value in ("false", "0", '""', "[]"):
+            with self.subTest(value=value):
+                self.add_config(f"[providers]\nplaceholder-arm = {value}\n")
+                with self.assertRaises(config.ConfigError) as refusal:
+                    config.load(str(self.config_path))
+                self.assertIn("[providers.placeholder-arm] is not a table", str(refusal.exception))
+                self._build_config()
+
     # ---- what the run records of it ----------------------------------------------
 
     def test_the_manifest_records_the_arm_and_the_names_of_its_variables_only(self):
