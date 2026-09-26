@@ -15,8 +15,9 @@ the published one names no harness, and a producer's first row is what registeri
 precedes. **The session log** is a fixture written by hand, carrying placeholder
 text only: a real session line is content, and content does not enter this repository in any form.
 
-Only `gh` is substituted, and it is substituted as a program on the path rather than inside the
-harness, so what a case asserts is the request that left the process.
+Only `gh` and `agy` are substituted, and they are substituted as programs on the path rather than
+inside the harness, so what a case asserts is the request that left the process — and, for `agy`,
+the user-level MCP configuration it lists, which is the machine's and never the case's to inherit.
 """
 
 import datetime
@@ -40,6 +41,16 @@ SESSION = FIXTURES / "session.jsonl"
 #: The stream the other client writes: one NDJSON event per line, into a file of the run's own.
 AGY_STREAM = FIXTURES / "agy-stream.jsonl"
 FAKE_GH = FIXTURES / "fake_gh.py"
+FAKE_AGY = FIXTURES / "fake_agy.py"
+BODY_CHECK = FIXTURES / "guardrails" / "scripts" / "pr_body_check.py"
+
+#: A pull request body the stand-in check passes: every section filled, every line answered.
+BODY = ("Motivation:\nplaceholder: why\n\nModification:\nplaceholder: what\n\n"
+        "Result:\nplaceholder: what is different\n\n## Classification\n"
+        "Scope class: test-tooling\nWall impact: none\nGenerated files touched: no\n"
+        "TCK obligation: n/a\nCompatibility impact: none\nCross-repo impact: none\n"
+        "ADRs referenced: none\nEvidence state: n/a\n\n## Verification\n"
+        "placeholder: the commands run\n")
 FIXTURE_CWD = "/tmp/placeholder/wt"
 
 CLIENT_ID = "Iv23liTESTclientid"
@@ -107,6 +118,11 @@ LOCAL_FENCE = f"{FENCE}-w-{LOCAL_SNAPSHOT[:12]}"
 ORACLE_ROUNDS = 2
 ORACLE_FENCE = (f"2026-09-19-harness-claude-oracle{ORACLE_ROUNDS}"
                 f"-cc-{CLIENT_VERSION.replace('.', '-')}")
+
+
+#: The version the placeholder MCP server's package states, and the patterns its task preserves.
+BRIDGE_VERSION = "0.6.0"
+PRESERVE = ("**/*.md",)
 
 
 def _entry(fence, producer):
@@ -245,12 +261,24 @@ class HarnessFixture(unittest.TestCase):
         self.key_path.chmod(0o600)
 
     def _build_gh(self):
-        """A `gh` on the path. Its state lives beside it, inside the temporary directory."""
+        """A `gh` and an `agy` on the path. Their state lives beside them, inside the temporary
+        directory."""
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
         shutil.copyfile(FAKE_GH, self.bin / "gh")
         (self.bin / "gh").chmod(0o755)
         self.gh_state = self.bin / "gh-state"
+        scripts = self.tmp / "guardrails" / "scripts"
+        scripts.mkdir(parents=True)
+        self.body_check = scripts / "pr_body_check.py"
+        shutil.copyfile(BODY_CHECK, self.body_check)
+        shutil.copyfile(FAKE_AGY, self.bin / "agy")
+        (self.bin / "agy").chmod(0o755)
+
+    def agy_servers(self, *lines):
+        """The servers the stand-in `agy mcp list` reports, one listing line each."""
+        (self.bin / "agy-mcp-list").write_text("".join(f"{line}\n" for line in lines),
+                                               encoding="utf-8")
 
     def _clone_of(self, name, seed):
         """A working clone of a fresh bare origin, seeded by `seed(directory)`."""
@@ -320,6 +348,9 @@ class HarnessFixture(unittest.TestCase):
             f'model_id = "{AGY_MODEL}"\n'
             f'credential = "{CREDENTIAL}"\n'
             'adapter = "antigravity"\n'
+            "\n"
+            "[pull_request]\n"
+            f'body_check = "{self.body_check}"\n'
         )
 
     def configure_domain(self, domain):
@@ -332,7 +363,79 @@ class HarnessFixture(unittest.TestCase):
         self.config_path.write_text(self.config_path.read_text().replace(
             f'domain = "{DOMAIN}"', f'domain = "{domain}"'))
 
+    # ---- the bridge, the registry and the register --------------------------------
+
+    def build_bridge(self, version=BRIDGE_VERSION, *, checkout=True):
+        """A package in the shape of the Exeris MCP server, configured as `[oracle] bridge`.
+
+        A git checkout of its own where `checkout` says so, so that its commit is what a pin reads;
+        the server itself is a placeholder file and is never run.
+        """
+        package = self.tmp / "exeris-ai-bridge"
+        (package / "dist").mkdir(parents=True)
+        (package / "dist" / "server.js").write_text("// placeholder: never run\n")
+        (package / "package.json").write_text(json.dumps({"name": "placeholder",
+                                                          "version": version}))
+        commit = None
+        if checkout:
+            self.git("init", "-b", "main", str(package))
+            self.git("add", "-A", cwd=package)
+            self.git("commit", "-m", "placeholder server", cwd=package)
+            commit = self.git("rev-parse", "HEAD", cwd=package).stdout.strip()
+        self.bridge = package / "dist" / "server.js"
+        self.add_config(f'[oracle]\nbridge = "{self.bridge}"\n')
+        return commit
+
+    def build_registry(self, task_id="T-0001", preserve=PRESERVE, *, body=None):
+        """A registry clone holding one task record, configured as `[registry] path`."""
+        root = self.tmp / "registry-clone"
+        tasks = root / "registry" / "tasks"
+        tasks.mkdir(parents=True, exist_ok=True)
+        document = {"id": task_id, "domain": DOCUMENTATION_DOMAIN}
+        if preserve is not None:
+            document["oracle_inputs"] = {"preserve": list(preserve)}
+        path = tasks / f"{task_id}.json"
+        path.write_text(json.dumps(document) if body is None else body, encoding="utf-8")
+        if "[registry]" not in self.config_path.read_text():
+            self.add_config(f'[registry]\npath = "{root}"\n')
+        return path
+
+    def add_config(self, text):
+        """Tables appended to the configuration; a table appended twice is merged by the case."""
+        self.config_path.write_text(self.config_path.read_text() + "\n" + text)
+
+    def configure_repo(self, *lines):
+        """Keys added to the `[repos.exeris-agent-harness]` table."""
+        self.config_path.write_text(self.config_path.read_text().replace(
+            f'scope = ["{SCOPE}"]\n', f'scope = ["{SCOPE}"]\n' + "".join(f"{line}\n"
+                                                                        for line in lines)))
+
+    def register_fence(self, *fences):
+        """Fence ids entered in the execution clone's register, for producers a case runs as."""
+        register = pathlib.Path(self.execution) / "docs" / "fences.md"
+        register.write_text(register.read_text(encoding="utf-8")
+                            + "".join(_entry(fence, "placeholder") for fence in fences),
+                            encoding="utf-8")
+
     # ---- the harness under test --------------------------------------------------
+
+    def write_body(self, text=BODY, kind="model"):
+        """The pull request body, where the run's arm writes it."""
+        path = self.run_dir(kind) / "body" / "pr-body.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def body_checks(self):
+        """Every invocation of the stand-in template check, as it recorded them."""
+        path = self.body_check.parent / "calls.jsonl"
+        if not path.is_file():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    #: Whether `cli` leaves a model run's body as the case left it. A case about the body sets it;
+    #: every other case closes its run with `BODY` in place, as an arm that wrote one would.
+    keep_body = False
 
     def cli(self, argv):
         """One subcommand in process, with the network call that mints a token replaced."""
@@ -346,6 +449,11 @@ class HarnessFixture(unittest.TestCase):
                 module.mint = lambda *a, **k: _Token(token=FAKE_TOKEN, expires_at=FAKE_EXPIRY)
         self.addCleanup(lambda: [setattr(m, "mint", fn) for m, fn in saved])
 
+        if argv and argv[0] == "close-run" and not self.keep_body:
+            run = argv[argv.index("--run") + 1]
+            body = self.state_root / "runs" / run / "body" / "pr-body.md"
+            if body.parent.is_dir() and not body.exists():
+                body.write_text(BODY, encoding="utf-8")
         try:
             code = harness.cli.main(list(argv))
         except SystemExit as stop:

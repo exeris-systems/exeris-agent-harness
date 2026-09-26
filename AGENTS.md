@@ -4,7 +4,7 @@ type: reference
 visibility: public
 owning-repo: exeris-agent-harness
 status: active
-last-verified: 2026-09-22
+last-verified: 2026-09-24
 ---
 
 # exeris-agent-harness
@@ -29,6 +29,9 @@ under `harness/` and the per-vendor launchers and readers under `adapters/` that
 - **A run never falls back to a person's credential.** Where the identity cannot mint its own
   token, a run refuses to open rather than borrowing the shell's — a change to `harness/token.py`
   or `harness/runstate.py` keeps that failure mode closed, not made silent.
+- **No pull request leaves with a body the organisation's gate would refuse** — how, in the README's
+  `close-run` paragraph and [`harness/pr_body.py`](harness/pr_body.py); the draft exemption is not a
+  way around it.
 - **The harness's own records never reach the inbox under the identity's token.** `close-run` acts
   as the identity and stops at a draft pull request against this repository's own remote; carrying
   a batch into the records inbox is `flush`, and it acts as the person, over their own `gh` and
@@ -43,7 +46,7 @@ under `harness/` and the per-vendor launchers and readers under `adapters/` that
 
 | Path | What it holds |
 | :-- | :-- |
-| [`harness/`](harness) | The commands and the seams they share: `cli.py`, `token.py`, `worktree.py`, `runner.py`, `record.py`, `oracle.py`, `drive.py`, `providers.py`, `capture.py`. |
+| [`harness/`](harness) | The commands and the seams they share: `cli.py`, `token.py`, `worktree.py`, `runner.py`, `record.py`, `oracle.py`, `drive.py`, `providers.py`, `capture.py`, `bridge.py` (the pinned Exeris MCP server), `registry.py` (a registered task's oracle inputs). The configuration keys are documented in `config.py` and in the README's *Configuration*. |
 | [`adapters/<vendor>/`](adapters) | One launcher and one session reader per vendor CLI (`claude`, `codex`, `gemini`, `antigravity`), and a headless pass where `drive` can run one — never a second place a row's fields are computed. |
 | [`bin/exeris-agent`](bin/exeris-agent) | The CLI entry point; holds no logic beyond putting the checkout on the import path. |
 | [`policy/README.md`](policy/README.md) | The map to the identity's ceiling and the organisation's rulesets — the boundary is configuration, this page points at it. |
