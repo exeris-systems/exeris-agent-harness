@@ -76,6 +76,18 @@ class CloseRunBodyTest(support.HarnessFixture):
         self.assertEqual(posted[0]["body"], checked[0]["body"])
         self.assertFalse(checked[0]["adr_touched"])
 
+    def test_the_check_is_started_with_no_credential_of_the_harness_s(self):
+        self.set_env("GITHUB_TOKEN", "placeholder-not-a-token")
+        self.set_env("GH_TOKEN", "placeholder-not-a-token")
+        self._opened()
+        self.write_body()
+        self.assertEqual(0, self._close(), self.said)
+        seen = set(self.body_checks()[-1]["environment"])
+        self.assertFalse({"GITHUB_TOKEN", "GH_TOKEN"} & seen, seen)
+        self.assertIn("GUARDRAILS_ADR_TOUCHED", seen)
+        self.assertLessEqual(seen, set(pr_body.CHECKER_ENVIRONMENT) | {"GUARDRAILS_ADR_TOUCHED"},
+                             seen)
+
     def test_a_run_with_no_body_is_refused_before_anything_is_pushed(self):
         self._opened()
         self.assertEqual(2, self._close())

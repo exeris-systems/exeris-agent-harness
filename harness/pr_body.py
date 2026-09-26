@@ -75,6 +75,11 @@ FEEDBACK_LINE = "- {message}\n"
 FEEDBACK_TAIL = ("\nRewrite the file so that the check passes. Do not change, stage or commit "
                  "anything in the repository.\n")
 
+#: The variables the checker is started with, and no others. It reads a file and a flag, so it
+#: needs an interpreter and a locale; a token in the harness's own environment is not its to hold,
+#: and what it prints is sent back into the session and kept with the run's stream.
+CHECKER_ENVIRONMENT = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR")
+
 #: One finding as the checker prints it: `::error file=…,line=…,title=…::<message>`.
 _FINDING = re.compile(r"^::error [^:]*::(?P<message>.+)$")
 
@@ -162,8 +167,7 @@ def check(checker_path: str, body: str, *, author: str, adr_touched: bool,
         raise CheckUnavailable(f"{author!r} is not a login the check can be asked about")
     if not _PATH.fullmatch(checker_path):
         raise CheckUnavailable("the checker's path carries a control character")
-    environment = {key: value for key, value in os.environ.items()
-                   if key not in ("GITHUB_EVENT_PATH", "GITHUB_STEP_SUMMARY")}
+    environment = {key: value for key, value in os.environ.items() if key in CHECKER_ENVIRONMENT}
     environment["GUARDRAILS_ADR_TOUCHED"] = "1" if adr_touched else "0"
     descriptor, body_file = tempfile.mkstemp(prefix="pr-body-", suffix=".md", dir=workdir)
     try:

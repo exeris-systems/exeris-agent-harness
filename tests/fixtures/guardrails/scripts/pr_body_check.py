@@ -28,7 +28,8 @@ def main():
         body = handle.read()
     adr = os.environ.get("GUARDRAILS_ADR_TOUCHED") == "1"
     with open(STATE, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"author": a.author, "adr_touched": adr, "body": body}) + "\n")
+        handle.write(json.dumps({"author": a.author, "adr_touched": adr, "body": body,
+                                 "environment": sorted(os.environ)}) + "\n")
     errors = [f"missing template section '{h}'" for h in HEADINGS if h not in body]
     errors += [f"'{m.group(1)}:' still holds the placeholder"
                for m in re.finditer(r"^([A-Za-z ]+): <.*>$", body, re.M)]
