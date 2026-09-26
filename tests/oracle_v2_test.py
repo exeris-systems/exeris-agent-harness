@@ -218,12 +218,21 @@ class CalibrationGenerationTest(SecondGenerationFixture):
 
     def test_a_passed_second_suite_admits_the_label_on_its_own_fence(self):
         self.build_registry()
+        self.build_bridge()
         self.close()
         row = self.staged_row()
         self.assertEqual("TRUE_DONE", row["outcome"])
         self.assertEqual(oracle.DOCS_SUITE_V2, row["oracle"]["calibration"]["suite"])
         self.assertEqual(support.FENCE.replace("harness-claude-", "harness-claude-v2-"),
                          row["instrument"]["fence"])
+
+    def test_the_second_suite_without_a_bridge_admits_no_label(self):
+        self.build_registry()
+        self.close()
+        row = self.staged_row()
+        self.assertEqual("UNKNOWN", row["outcome"])
+        self.assertEqual(oracle.DOCS_SUITE_V2, row["oracle"]["calibration"]["suite"])
+        self.assertIn(oracle.NO_BRIDGE, self.judgement()["reason"])
 
     def test_the_first_suite_is_the_fallback_and_its_oracle_is_asked_nothing_new(self):
         pathlib.Path(self.execution).joinpath(*oracle.DOCS_SELFTEST_V2).unlink()

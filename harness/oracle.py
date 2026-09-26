@@ -99,6 +99,10 @@ SUITE = "suite"
 #: Where a judgement carries the MCP server the oracle reported reading through.
 BRIDGE = "bridge"
 
+#: Why a judgement under the second generation's suite is `UNKNOWN` where no bridge is configured.
+NO_BRIDGE = ("the second generation reads link stubs through the Exeris MCP server, and no "
+             "[oracle] bridge is configured")
+
 
 def suite(domain: str) -> str | None:
     """The suite that calibrates the oracle of this domain, where the register names one."""
@@ -307,6 +311,12 @@ def judge(worktree: str, domain: str, *, execution_repo: str | None = None,
     if domain == DOCS_DOMAIN:
         extras = _extras(state, base=base, preserve=preserve, bridge=bridge)
         found, reason = _docs_judgement(worktree, execution_repo, index, extras)
+        if _suite_of(state) == DOCS_SUITE_V2 and not bridge:
+            # The second generation's suite calibrated an oracle that read link stubs through the
+            # bridge. Asked without one, the oracle answers the first generation's question, and a
+            # label for that question under this suite would claim a check nobody made.
+            found["outcome"] = UNKNOWN
+            reason = "; ".join(x for x in (reason, NO_BRIDGE) if x)
         judged = {"outcome": found["outcome"], "calibration": state, "version": found["version"],
                   "gates": found["gates"], "reason": "; ".join(x for x in (why, reason) if x)}
         if found.get(BRIDGE):
