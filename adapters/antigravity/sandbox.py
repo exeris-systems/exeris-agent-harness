@@ -17,8 +17,10 @@ filesystems over `/tmp` and the home come before every bind beneath them:
   emptied on its own because the state root can be moved outside the home, where the read-only root
   would otherwise show it;
 * a fresh `/dev` and `/proc`;
-* read-write: the worktree, the run's own home for this client (it writes its state there), and the
-  worktree's git common directory, where `git commit` writes objects and refs;
+* read-write: the worktree, the run's own home for this client (it writes its state there), the
+  worktree's git common directory, where `git commit` writes objects and refs, and the run's body
+  directory, where the pass writes the pull request's body when asked for it — given to the client
+  as a readable directory, and mounted here rather than refused as a path among the runs;
 * read-only over that: the clone's own configuration and hooks directory and the worktree's own
   configuration, where a `core.hooksPath` would take precedence over the run's and stop the hook
   that stamps `Exeris-Run:`;
@@ -65,7 +67,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from adapters.antigravity import drive  # noqa: E402
-from harness import bridge, config  # noqa: E402
+from harness import bridge, config, pr_body  # noqa: E402
 
 #: The program the plan is handed to.
 BWRAP = "bwrap"
@@ -86,13 +88,15 @@ SHARED_TEMPORARY = os.path.join(os.sep, "tmp")
 
 #: The variables the client is started with, where they are set; every other one is cleared. The
 #: locale and terminal; the session bus the keyring sign-in goes through; the run's git identity,
-#: configuration and the closures under its credential helper; the run's id. Not the installation
+#: configuration and the closures under its credential helper; the run's id and the path the pull
+#: request's body is written to. Not the installation
 #: token, the `gh` configuration, or anything the person's shell carried besides these.
 KEPT_ENVIRONMENT = ("PATH", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TERM", "TZ",
                     "USER", "LOGNAME", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR",
                     "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_SSH_COMMAND",
                     "GIT_TERMINAL_PROMPT", "GIT_ASKPASS", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
-                    "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EXERIS_RUN")
+                    "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EXERIS_RUN",
+                    pr_body.VARIABLE)
 
 
 def argv(run_dir: str, worktree: str, readable, agy_command, *,
@@ -120,13 +124,15 @@ def argv(run_dir: str, worktree: str, readable, agy_command, *,
            "--tmpfs", runs,
            "--dev", "/dev",
            "--proc", "/proc"]
-    for path in (worktree, agy_home, git_common_dir):
+    body = os.path.join(run_dir, pr_body.DIRECTORY)
+    for path in (worktree, agy_home, git_common_dir, body if os.path.isdir(body) else None):
         if path:
             out += ["--bind", path, path]
     out += _git_settings(git_common_dir, git_dir)
     for path in (os.path.join(run_dir, GITCONFIG), os.path.join(run_dir, HOOKS)):
         out += ["--ro-bind", path, path]
-    out += _read_only([*readable, bridge_dir, docs_root, *program_dirs], runs, home)
+    out += _read_only([path for path in readable if os.path.abspath(path) != body]
+                      + [bridge_dir, docs_root, *program_dirs], runs, home)
     out += _covered(secrets, runs, home)
     bus = os.path.join(runtime, "bus")
     out += ["--tmpfs", runtime,

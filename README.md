@@ -364,8 +364,8 @@ bounds the client's own file tools, not the commands the list grants; those are 
 launcher, which runs the client under bubblewrap (`adapters/antigravity/sandbox.py`). The root is
 mounted read-only; the home, `/tmp`, the directory of runs (this run's and every other) and the
 user's runtime directory are emptied;
-then the worktree, the client's own home and the worktree's git directory are mounted back
-read-write, with the clone's configuration and hooks and the worktree's own configuration read-only
+then the worktree, the client's own home, the worktree's git directory and the run's `body`
+directory, where the pass writes the pull request's body, are mounted back read-write, with the clone's configuration and hooks and the worktree's own configuration read-only
 over it, so that no `core.hooksPath` set from inside stops the hook that stamps `Exeris-Run:`. The
 run's git configuration and hooks, the readable directories, the pinned server, its documentation
 root and the directories of the client's and the server's programs are mounted read-only. The
