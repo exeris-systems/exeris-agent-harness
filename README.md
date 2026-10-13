@@ -342,8 +342,7 @@ tools}` (with Antigravity's `observed` listing line beside them) for an arm give
   harness did not write, and the run is refused. `drive` checks the home's grants and the listing
   again before its first pass.
 
-**What a pass is allowed.** Each arm is given a fixed surface, and the two surfaces cover the same
-reading capability. Claude Code's `drive` passes get `--allowedTools` with
+**What a pass is allowed.** Each arm is given a fixed surface. Claude Code's `drive` passes get `--allowedTools` with
 `Read,Edit,Write,Glob,Grep` and `Bash(<command>:*)` for `git add`, `git commit`, `git status`,
 `git diff`, `git log` and `ls`, plus the three server tools for an arm given the server.
 
@@ -365,9 +364,11 @@ bounds the client's own file tools, not the commands the list grants; those are 
 launcher, which runs the client under bubblewrap (`adapters/antigravity/sandbox.py`). The root is
 mounted read-only; the home, `/tmp`, the run directory and the user's runtime directory are emptied;
 then the worktree, the client's own home and the worktree's git directory are mounted back
-read-write, and the run's git configuration and hooks, the readable directories, the pinned server,
-its documentation root and the directories of the client's and the server's programs read-only,
-with the session bus the keyring sign-in uses. The App's private key and its age identity are
+read-write, with the clone's configuration and hooks and the worktree's own configuration read-only
+over it, so that no `core.hooksPath` set from inside stops the hook that stamps `Exeris-Run:`. The
+run's git configuration and hooks, the readable directories, the pinned server, its documentation
+root and the directories of the client's and the server's programs are mounted read-only. The
+session bus socket, which the keyring sign-in uses, is bound read-write on its own. The App's private key and its age identity are
 covered by an empty file wherever they are configured. Of the environment only the locale, the
 session bus, the run's git identity and configuration and `EXERIS_RUN` are passed, to bubblewrap
 itself as well as to the client, so `GH_TOKEN` cannot be read from `/proc`.

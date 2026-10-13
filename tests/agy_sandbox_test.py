@@ -130,6 +130,17 @@ class ArgvTest(unittest.TestCase):
         self.assertNotIn(("--bind-try", "/run/user/4242", "/run/user/4242"),
                          [b[:3] for b in _binds(self.argv, {"--bind-try"})])
 
+    def test_the_clone_s_and_the_worktree_s_git_settings_are_read_only_over_the_git_directory(self):
+        argv = sandbox.argv(str(self.at.run), str(self.at.worktree), [], ["agy"],
+                            home=str(self.at.home), uid=4242, git_common_dir=str(self.at.common),
+                            git_dir=str(self.at.common / "worktrees" / "wt"), environment={})
+        writable = argv.index(str(self.at.common))
+        settings = [b for b in _binds(argv, {"--ro-bind-try"})]
+        self.assertEqual({str(self.at.common / "config"), str(self.at.common / "hooks"),
+                          str(self.at.common / "worktrees" / "wt" / "config.worktree")},
+                         {b[1] for b in settings})
+        self.assertTrue(all(b[1] == b[2] and b[3] > writable for b in settings))
+
     def test_what_the_client_only_reads_is_bound_read_only(self):
         ro = {source for flag, source, destination, _ in _binds(self.argv, {"--ro-bind"})
               if source == destination}
@@ -275,10 +286,18 @@ class ConfinedTest(unittest.TestCase):
         git("worktree", "add", "-q", "-b", "run", str(self.at.worktree), cwd=origin)
         common = git("-C", str(self.at.worktree), "rev-parse", "--path-format=absolute",
                      "--git-common-dir")
+        own = git("-C", str(self.at.worktree), "rev-parse", "--path-format=absolute", "--git-dir")
+        git("config", "extensions.worktreeConfig", "true", cwd=origin)
+        git("config", "--worktree", "user.name", "placeholder", cwd=self.at.worktree)
+        # Inside, a hooks path set in the clone's or the worktree's own configuration would outrank
+        # the run's; both are read-only there, so the attempt fails and the stamp is still made.
         argv = sandbox.argv(str(self.at.run), str(self.at.worktree), [],
-                            ["sh", "-c", "echo change > f.txt && git add f.txt && "
+                            ["sh", "-c", "git config --local core.hooksPath /nonexistent; "
+                                         "git config --worktree core.hooksPath /nonexistent; "
+                                         "echo change > f.txt && git add f.txt && "
                                          "git commit -q -m 'placeholder: change'"],
-                            home=str(self.at.home), git_common_dir=common, environment=env)
+                            home=str(self.at.home), git_common_dir=common, git_dir=own,
+                            environment=env)
         done = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(0, done.returncode, done.stderr)
         self.assertIn("Exeris-Run: RUN", git("log", "-1", "--format=%B", "run", cwd=origin))

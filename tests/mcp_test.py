@@ -231,7 +231,7 @@ class AntigravityMcpTest(McpFixture):
         # The rest stand in for the reading tools the other arm is given as tools: commands that
         # read. Neither `git config` nor `git branch` is among them: the first can unset the hook
         # that stamps the run's commits, the second can delete branches in the shared clone.
-        self.assertTrue({"Read", "Glob", "Grep"} <= set(tools), tools)
+        self.assertLessEqual({"Read", "Glob", "Grep"}, set(tools))
         self.assertFalse({"command(git config)", "command(git branch)"} & set(granted), granted)
         self.assertEqual(["command(pwd)", "command(cat)", "command(head)", "command(tail)",
                           "command(find)", "command(grep)", "command(wc)",

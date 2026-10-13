@@ -15,16 +15,19 @@ filesystems over `/tmp` and the home come before every bind beneath them:
   run's installation token and environment file, every other run directory and every other
   worktree. The run directory is emptied on its own because a state root can be moved outside the
   home, where the read-only root would otherwise show it;
-* the App's private key and the identity it is decrypted with, each covered by an empty file where
-  the empty filesystems do not already hide it — a key configured under `/etc` or `/opt` is on the
-  read-only root;
 * a fresh `/dev` and `/proc`;
 * read-write: the worktree, the run's own home for this client (it writes its state there), and the
   worktree's git common directory, where `git commit` writes objects and refs;
+* read-only over that: the clone's own configuration and hooks directory and the worktree's own
+  configuration, where a `core.hooksPath` would take precedence over the run's and stop the hook
+  that stamps `Exeris-Run:`;
 * read-only: the run's git configuration and hooks directory — what `GIT_CONFIG_GLOBAL` names and
-  the hook that stamps `Exeris-Run:` — each readable directory, the pinned server's package and the
-  documentation root it serves, and the directories holding the client's and the server's programs
-  where the empty filesystems would otherwise hide them;
+  that hook — each readable directory, the pinned server's package and the documentation root it
+  serves, and the directories holding the client's and the server's programs where the empty
+  filesystems would otherwise hide them;
+* the App's private key and the identity it is decrypted with, each covered by an empty file where
+  the empty filesystems do not already hide it — a key configured under `/etc` or `/opt` is on the
+  read-only root, and the cover lies over whatever read-only directory holds it;
 * the user's runtime directory emptied, and in it only the session bus socket bound, read-write:
   the client signs in through the keyring over that bus, and nothing else there — an SSH or GnuPG
   agent's socket among them — is the client's to reach;
@@ -66,7 +69,7 @@ from harness import bridge, config  # noqa: E402
 #: The program the plan is handed to.
 BWRAP = "bwrap"
 
-#: The two files and the directory of the run the git inside the sandbox reads.
+#: The file and the directory of the run the git inside the sandbox reads.
 GITCONFIG = "gitconfig"
 HOOKS = "hooks"
 
@@ -75,6 +78,10 @@ ADD_DIR = "--add-dir"
 
 #: Where a pinned server's entry point lives inside its package: `<package>/dist/server.js`.
 _ENTRY_DEPTH = 2
+
+#: The system's shared temporary directory, emptied inside the sandbox: any process on the machine
+#: may leave a file there, so nothing of it is the client's to read.
+SHARED_TEMPORARY = os.path.join(os.sep, "tmp")
 
 #: The variables the client is started with, where they are set; every other one is cleared. The
 #: locale and terminal; the session bus the keyring sign-in goes through; the run's git identity,
@@ -88,23 +95,25 @@ KEPT_ENVIRONMENT = ("PATH", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAG
 
 
 def argv(run_dir: str, worktree: str, readable, agy_command, *,
-         home: str = os.environ["HOME"], uid: int = os.getuid(), bridge_dir: str | None = None,
-         git_common_dir: str | None = None, docs_root: str | None = None,
-         program_dirs=(), secrets=(), environment=None) -> list[str]:
+         home: str | None = None, uid: int | None = None, bridge_dir: str | None = None,
+         git_common_dir: str | None = None, git_dir: str | None = None,
+         docs_root: str | None = None, program_dirs=(), secrets=(),
+         environment=None) -> list[str]:
     """The bubblewrap command line that runs `agy_command` inside the plan the module states.
 
     Every path is mounted at its own name. `program_dirs` are the directories the client's and the
     server's programs are found in that the empty home or `/tmp` would hide; `bridge_dir` and
     `docs_root` are mounted only when given. `secrets` are files covered by an empty one where the
     empty filesystems leave them visible. Of `environment` (the launcher's own, by default) only
-    `KEPT_ENVIRONMENT` is passed in.
+    `KEPT_ENVIRONMENT` is passed in. `home` and `uid` are the launcher's own unless given.
     """
-    environment = kept(os.environ if environment is None else environment)
+    home = os.environ["HOME"] if home is None else home
+    uid = os.getuid() if uid is None else uid
     agy_home = drive.home(run_dir)
     runtime = f"/run/user/{uid}"
     out = [BWRAP, "--die-with-parent", "--unshare-pid",
            "--ro-bind", "/", "/",
-           "--tmpfs", "/tmp",
+           "--tmpfs", SHARED_TEMPORARY,
            "--tmpfs", home,
            "--tmpfs", run_dir,
            "--dev", "/dev",
@@ -112,28 +121,55 @@ def argv(run_dir: str, worktree: str, readable, agy_command, *,
     for path in (worktree, agy_home, git_common_dir):
         if path:
             out += ["--bind", path, path]
-    read_only = [os.path.join(run_dir, GITCONFIG), os.path.join(run_dir, HOOKS), *readable,
-                 bridge_dir, docs_root, *program_dirs]
-    for path in _unique(read_only):
-        for covered in (run_dir, home):
-            if _within(covered, path):
-                raise ValueError(f"{path} holds {covered}, which the sandbox exists to hide")
-        out += ["--ro-bind", path, path]
-    for path in _unique(secrets):
-        if os.path.isfile(path) and not _hidden(path, home, run_dir):
-            out += ["--ro-bind", os.devnull, path]
+    out += _git_settings(git_common_dir, git_dir)
+    out += _read_only([os.path.join(run_dir, GITCONFIG), os.path.join(run_dir, HOOKS), *readable,
+                       bridge_dir, docs_root, *program_dirs], run_dir, home)
+    out += _covered(secrets, run_dir, home)
     bus = os.path.join(runtime, "bus")
     out += ["--tmpfs", runtime,
             "--bind-try", bus, bus,
             "--remount-ro", home,
             "--remount-ro", run_dir,
             "--clearenv"]
-    for key in KEPT_ENVIRONMENT:
-        if key in environment:
-            out += ["--setenv", key, environment[key]]
+    for key, value in kept(os.environ if environment is None else environment).items():
+        out += ["--setenv", key, value]
     out += ["--setenv", "HOME", agy_home,
             "--chdir", worktree,
             "--", *agy_command]
+    return out
+
+
+def _git_settings(git_common_dir: str | None, git_dir: str | None) -> list[str]:
+    """The clone's configuration and hooks and the worktree's own configuration, read-only over the
+    writable git directory, so that no `core.hooksPath` set from inside outranks the run's."""
+    paths = []
+    if git_common_dir:
+        paths += [os.path.join(git_common_dir, "config"), os.path.join(git_common_dir, "hooks")]
+    if git_dir:
+        paths.append(os.path.join(git_dir, "config.worktree"))
+    out = []
+    for path in _unique(paths):
+        out += ["--ro-bind-try", path, path]
+    return out
+
+
+def _read_only(paths, run_dir: str, home: str) -> list[str]:
+    """Each path bound read-only; one that holds the run directory or the home is refused."""
+    out = []
+    for path in _unique(paths):
+        for covered in (run_dir, home):
+            if _within(covered, path):
+                raise ValueError(f"{path} holds {covered}, which the sandbox exists to hide")
+        out += ["--ro-bind", path, path]
+    return out
+
+
+def _covered(secrets, run_dir: str, home: str) -> list[str]:
+    """An empty file over each secret the empty filesystems leave visible."""
+    out = []
+    for path in _unique(secrets):
+        if os.path.isfile(path) and not _hidden(path, home, run_dir):
+            out += ["--ro-bind", os.devnull, path]
     return out
 
 
@@ -185,11 +221,12 @@ def server(run_dir: str) -> tuple[str | None, str | None]:
     return package, root
 
 
-def common_dir(worktree: str) -> str | None:
-    """The worktree's git common directory, where its objects and refs are written."""
+def common_dir(worktree: str, which: str = "--git-common-dir") -> str | None:
+    """The worktree's git common directory, where its objects and refs are written — or, with
+    `which="--git-dir"`, the worktree's own git directory, where its own configuration is."""
     try:
         done = subprocess.run(["git", "-C", worktree, "rev-parse", "--path-format=absolute",
-                               "--git-common-dir"], capture_output=True, text=True, timeout=30)
+                               which], capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
         return None
     path = done.stdout.strip()
@@ -203,7 +240,7 @@ def _within(path: str, top: str) -> bool:
 
 def _hidden(path: str, home: str, run_dir: str | None = None) -> bool:
     """Whether the empty home, `/tmp` or run directory covers `path` inside the sandbox."""
-    return any(_within(path, top) for top in (home, "/tmp", run_dir) if top)
+    return any(_within(path, top) for top in (home, SHARED_TEMPORARY, run_dir) if top)
 
 
 def program_dirs(programs, home: str) -> list[str]:
@@ -245,6 +282,7 @@ def main(args) -> int:
     try:
         command = argv(run_dir, worktree, readable_dirs(agy_command[1:]), agy_command, home=home,
                        bridge_dir=bridge_dir, git_common_dir=common_dir(worktree),
+                       git_dir=common_dir(worktree, "--git-dir"),
                        docs_root=docs_root, program_dirs=program_dirs(programs, home),
                        secrets=secrets)
     except ValueError as exc:
