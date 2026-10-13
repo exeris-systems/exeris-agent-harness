@@ -7,13 +7,15 @@ pins. The cases pin what has to hold however the clients change:
   configuration into the run's directory; every driven pass names it with `--mcp-config` and drops
   the person's own servers with `--strict-mcp-config`, and the server's read-only documentation
   tools are allowed by the name the client gives an MCP tool.
-* *Antigravity is checked, not given.* It reads its own user-level configuration, so the run opens
-  only where that configuration enables exactly the pinned server — and, for an arm not given the
-  server, only where it enables none of the bridge — because the arms of a group read through the
-  same context tools.
-* *The manifest says what the arm had, and the row's fence says it too.*
+* *Antigravity is given a home of the run's own.* It reads its permissions and its servers from
+  files under `$HOME`, so `open-run` writes `<run>/agy-home` with the fixed allow-list and the
+  pinned server or none, and the person's own configuration decides nothing. What the client lists
+  under that home is checked — exactly the pinned server, or none — because a listing that differs
+  is a client reading its servers from somewhere the harness did not write.
+* *The manifest says what the arm had and was allowed, and the row's fence says it too.*
 
-`agy mcp list` is answered by the stand-in the fixture puts on the path.
+`agy mcp list` is answered by the stand-in the fixture puts on the path, from the home it runs
+under.
 """
 
 import contextlib
@@ -38,6 +40,12 @@ from harness import bridge, cli, config  # noqa: E402
 #: The three tools the claude arm is allowed, by the name Claude Code gives an MCP tool.
 EXPECTED_TOOLS = ["mcp__exeris__docs-list_adrs", "mcp__exeris__docs-get_adr",
                   "mcp__exeris__docs-search"]
+
+#: What the Antigravity arm's home allows, in that client's grammar: Claude Code's commands, and
+#: the same three server tools where the arm is given the server.
+AGY_COMMANDS = ["command(git add)", "command(git commit)", "command(git status)",
+                "command(git diff)", "command(git log)", "command(ls)"]
+AGY_MCP = ["mcp(exeris/docs-list_adrs)", "mcp(exeris/docs-get_adr)", "mcp(exeris/docs-search)"]
 
 MCP_FENCE = support.FENCE.replace("harness-claude-", "harness-claude-mcp-")
 
@@ -146,64 +154,140 @@ class ClaudeMcpTest(McpFixture):
 
 
 class AntigravityMcpTest(McpFixture):
-    """The client that reads its servers from its own configuration."""
+    """The client that reads its permissions and its servers from a home of the run's own."""
 
     def pinned_line(self, name="exeris", status="enabled"):
         return f"{name}  stdio  {status}  node {self.bridge.resolve()}"
 
     def open_agy(self):
-        with contextlib.redirect_stdout(io.StringIO()):
+        said = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(said):
             code = self.cli(["open-run", "--repo", str(self.clone), "--provider", "antigravity",
                              "--task", support.TASK, "--scope", support.SCOPE,
                              "--prompt-file", str(self.task)])
-        self.assertEqual(0, code)
+        self.assertEqual(0, code, said.getvalue())
         return self.manifest()
 
-    def test_a_configured_server_that_is_the_pinned_one_is_accepted_and_recorded(self):
+    def agy_home(self):
+        return self.run_dir() / agy_drive.HOME
+
+    def read_home(self, *parts):
+        return json.loads((self.agy_home() / pathlib.Path(*parts)).read_text(encoding="utf-8"))
+
+    def assert_home(self, allow, servers):
+        """The run's home holds the three files the client reads, as the harness wrote them, and
+        nothing else — no credential, no file carried in from the person's home."""
+        home = self.agy_home()
+        self.assertEqual({"permissions": {"allow": allow}, "allowNonWorkspaceAccess": False,
+                          "trustedWorkspaces": [str(self.worktree())]},
+                         self.read_home(".gemini", "antigravity-cli", "settings.json"))
+        self.assertEqual({"userSettings": {"globalPermissionGrants": {"allow": []},
+                                           "permissionGrantsV2Migrated": True}},
+                         self.read_home(".gemini", "config", "config.json"))
+        self.assertEqual({"mcpServers": servers},
+                         self.read_home(".gemini", "config", "mcp_config.json"))
+        files = sorted(str(path.relative_to(home)) for path in home.rglob("*") if path.is_file())
+        self.assertEqual([".gemini/antigravity-cli/settings.json", ".gemini/config/config.json",
+                          ".gemini/config/mcp_config.json"], files)
+        for path in [home, *home.rglob("*")]:
+            with self.subTest(path=str(path)):
+                self.assertEqual(0o700 if path.is_dir() else 0o600, path.stat().st_mode & 0o777)
+
+    def test_an_arm_given_the_server_gets_a_home_granting_the_commands_and_its_three_tools(self):
         self.give_mcp()
-        self.agy_servers("other  stdio  enabled  node /opt/placeholder/server.js",
-                         self.pinned_line())
         manifest = self.open_agy()
+        self.assert_home(AGY_COMMANDS + AGY_MCP, {"exeris": {
+            "command": "node", "args": [str(self.bridge.resolve())],
+            # The first readable directory that publishes the registry, as for the other client.
+            "env": {"EXERIS_DOCS_ROOT": str(self.docs), "EXERIS_BRIDGE_MODE": "contributor"},
+            "disabled": False}})
         self.assertEqual({"server": "exeris",
                           "bridge": {"version": support.BRIDGE_VERSION,
                                      "commit": self.commit_of_bridge},
-                          "tools": list(agy_drive.MCP_TOOLS),
+                          "tools": list(claude_drive.MCP_TOOLS),
                           "observed": " ".join(self.pinned_line().split())}, manifest["mcp"])
-        # Nothing is written for a client that takes no configuration per invocation.
+        self.assertEqual(AGY_COMMANDS + AGY_MCP, manifest["permissions"])
+        # The configuration file is the other client's; this one reads its home.
         self.assertFalse((self.run_dir() / cli.MCP_FILE).exists())
 
-    def test_a_configured_server_other_than_the_pinned_one_is_refused(self):
+    def test_an_arm_not_given_the_server_gets_a_home_granting_the_commands_and_no_server(self):
+        manifest = self.open_agy()
+        self.assert_home(AGY_COMMANDS, {})
+        self.assertIsNone(manifest["mcp"])
+        self.assertEqual(AGY_COMMANDS, manifest["permissions"])
+
+    def test_the_allow_list_is_the_one_the_other_arm_is_given(self):
+        self.assertEqual(AGY_COMMANDS + AGY_MCP, agy_drive.permissions(mcp=True))
+        self.assertEqual(list(claude_drive.MCP_TOOLS), list(agy_drive.MCP_TOOLS))
+        commands = [entry[len("Bash("):-len(":*)")] for entry
+                    in claude_drive.ALLOWED_TOOLS.split(",") if entry.startswith("Bash(")]
+        self.assertEqual([f"command({command})" for command in commands],
+                         agy_drive.permissions(mcp=False))
+
+    def test_the_person_s_own_configuration_decides_nothing(self):
+        # Servers and grants a person configured by hand, the bridge among them: none of them
+        # reaches the run's home, and none of them refuses a run.
+        self.person_agy_config({"exeris": {"command": "node", "args": [str(self.bridge.resolve())]},
+                                "other": {"command": "node", "args": ["/opt/placeholder/s.js"]}},
+                               allow=["command(rm -rf)", "command(git push)"])
+        original = self.config_path.read_text()
+        for flag, allow, servers in (("false", AGY_COMMANDS, 0),
+                                     ("true", AGY_COMMANDS + AGY_MCP, 1)):
+            with self.subTest(mcp=flag):
+                self.config_path.write_text(original)
+                self.give_mcp(flag)
+                manifest = self.open_agy()
+                self.assertEqual(allow, manifest["permissions"])
+                self.assertEqual(allow, self.read_home(".gemini", "antigravity-cli",
+                                                       "settings.json")["permissions"]["allow"])
+                self.assertEqual(servers, len(self.read_home(".gemini", "config",
+                                                             "mcp_config.json")["mcpServers"]))
+
+    def test_a_server_the_client_finds_outside_the_run_s_home_is_refused(self):
+        original = self.config_path.read_text()
+        for flag in ("true", "false"):
+            for listing in (("other  stdio  enabled  node /opt/placeholder/server.js",),
+                            (self.pinned_line(name="second"),)):
+                with self.subTest(mcp=flag, listing=listing):
+                    self.config_path.write_text(original)
+                    self.give_mcp(flag)
+                    self.agy_servers(*listing)
+                    said = self.open_refused("antigravity")
+                    self.assertIn("under the run's own home", said)
+        # A refused run leaves no home behind: the run's directory goes with it.
+        self.assertEqual([], list(self.state_root.rglob(agy_drive.HOME)))
+
+    def test_the_driven_passes_read_the_run_s_home(self):
         self.give_mcp()
-        for listing in (("exeris  stdio  enabled  node /opt/elsewhere/dist/server.js",),
-                        (self.pinned_line(status="disabled"),),
-                        ()):
-            with self.subTest(listing=listing):
-                self.agy_servers(*listing)
-                said = self.open_refused("antigravity")
-                self.assertIn("agy mcp add", said)
-                self.assertIn(f"node {self.bridge.resolve()}", said)
-
-    def test_an_arm_not_given_the_server_is_refused_where_its_client_enables_the_bridge(self):
-        self.give_mcp("false")
-        for line in (self.pinned_line(name="anything"),
-                     "exeris-ai-bridge  stdio  enabled  node /opt/exeris-ai-bridge/dist/server.js"):
-            with self.subTest(line=line):
-                self.agy_servers(line)
-                self.assertIn("agy mcp disable", self.open_refused("antigravity"))
-
-    def test_an_arm_not_given_the_server_opens_where_the_bridge_is_disabled(self):
-        self.agy_servers(self.pinned_line(status="disabled"),
-                         "other  stdio  enabled  node /opt/placeholder/server.js")
-        self.assertIsNone(self.open_agy()["mcp"])
-
-    def test_a_configuration_changed_after_the_run_opened_is_not_driven(self):
-        self.give_mcp()
-        self.agy_servers(self.pinned_line())
+        self.person_agy_config({"other": {"command": "node", "args": ["/opt/placeholder/s.js"]}})
         self.conversation = "00000000-0000-4000-8000-00000000000a"
         self.script = [_judgement("TRUE_DONE")]
         self.open_agy()
-        self.agy_servers(self.pinned_line(), self.pinned_line(name="second"))
+        self.assertEqual(0, self.drive(0), self.said)
+        self.assertEqual(1, len(self.passes))
+
+    def test_a_home_whose_servers_changed_after_the_run_opened_is_not_driven(self):
+        self.give_mcp()
+        self.conversation = "00000000-0000-4000-8000-00000000000a"
+        self.script = [_judgement("TRUE_DONE")]
+        self.open_agy()
+        servers = self.agy_home() / ".gemini" / "config" / "mcp_config.json"
+        written = json.loads(servers.read_text(encoding="utf-8"))
+        written["mcpServers"]["second"] = written["mcpServers"]["exeris"]
+        servers.write_text(json.dumps(written), encoding="utf-8")
         self.assertEqual(2, self.drive(0))
+        self.assertEqual([], self.passes)
+
+    def test_a_home_whose_grants_changed_after_the_run_opened_is_not_driven(self):
+        self.conversation = "00000000-0000-4000-8000-00000000000a"
+        self.script = [_judgement("TRUE_DONE")]
+        self.open_agy()
+        settings = self.agy_home() / ".gemini" / "antigravity-cli" / "settings.json"
+        written = json.loads(settings.read_text(encoding="utf-8"))
+        written["permissions"]["allow"].append("command(git push)")
+        settings.write_text(json.dumps(written), encoding="utf-8")
+        self.assertEqual(2, self.drive(0))
+        self.assertIn("no longer grants", self.said)
         self.assertEqual([], self.passes)
 
     def test_the_listing_is_read_as_the_client_prints_it(self):

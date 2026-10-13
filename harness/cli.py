@@ -299,15 +299,18 @@ def _launch_values(arm, prompt_file: str | None) -> dict:
 MCP_FILE = "mcp.json"
 
 #: How an adapter's client is given an MCP server, as its drive module's `MCP_ROUTE` names it: a
-#: configuration file per invocation, or the client's own user-level configuration.
+#: configuration file per invocation, or a home of the run's own that the client reads it from.
 MCP_BY_CONFIG = "config"
-MCP_BY_USER = "user"
+MCP_BY_HOME = "home"
 
 #: Where the manifest records what MCP server the arm was given, `None` for none.
 MCP_KEY = "mcp"
 
-#: Where an arm checked against its client's own configuration records the server line it found.
+#: Where an arm given its server through the run's home records the server line its client listed.
 OBSERVED = "observed"
+
+#: Where the manifest records what a pass of the arm was allowed, in its client's own grammar.
+PERMISSIONS_KEY = "permissions"
 
 
 def _task_plan(cfg, task: str) -> tuple[dict | None, str | None]:
@@ -338,40 +341,43 @@ def _bridge_pin(cfg) -> dict | None:
         raise Refused(str(exc)) from None
 
 
-def _user_mcp(module, pinned_path: str | None, *, enabled: bool) -> str | None:
-    """The client's own configured server line, checked against what the arm is given."""
+def _home_mcp(module, run_dir: str, pinned_path: str | None, *, enabled: bool) -> str | None:
+    """The server line the client lists under the run's home, checked against what the arm is
+    given."""
     try:
-        return module.mcp_state(pinned_path, enabled=enabled)
+        return module.mcp_state(run_dir, pinned_path, enabled=enabled)
     except module.McpRefused as exc:
         raise Refused(str(exc)) from None
+
+
+def _permissions(module, mcp: dict | None) -> list[str] | None:
+    """What the arm is allowed, where the run's own home grants it, as the manifest records it."""
+    if getattr(module, "MCP_ROUTE", None) != MCP_BY_HOME:
+        return None
+    return module.permissions(mcp=bool(mcp))
 
 
 def _arm_mcp(cfg, repo_config, adapter: str,
              pinned: dict | None) -> tuple[dict | None, dict | None]:
     """`(manifest record, MCP configuration to write)` for the arm, or `Refused`.
 
-    An arm whose repository says `mcp = true` is given the pinned server: a client that takes a
-    configuration per invocation gets one written for it, and a client that reads its own has that
-    configuration checked. An arm not given it is held to having none of the bridge, where its
-    client's own configuration could supply one.
+    An arm whose repository says `mcp = true` is given the pinned server, in a one-server
+    configuration: a file on each invocation's command line for a client that takes one, or the
+    server file of the run's own home for a client that reads it from there. Which one is the
+    caller's to write, once the run's directory exists.
     """
     module = _drive_module(adapter)
     route = getattr(module, "MCP_ROUTE", None)
     if not repo_config.mcp:
-        if route == MCP_BY_USER:
-            _user_mcp(module, bridge.path_of(pinned), enabled=False)
         return None, None
     if not pinned:
         raise Refused(f"[repos.{repo_config.name}] sets mcp = true and [oracle] bridge names no "
                       f"server to give the arm")
-    if route not in (MCP_BY_CONFIG, MCP_BY_USER):
+    if route not in (MCP_BY_CONFIG, MCP_BY_HOME):
         raise Refused(f"[repos.{repo_config.name}] sets mcp = true and the {adapter} adapter "
                       f"has no way to give its client an MCP server")
     record_of = {"server": bridge.SERVER, bridge.MANIFEST_KEY: bridge.recorded(pinned),
                  "tools": list(module.MCP_TOOLS)}
-    if route == MCP_BY_USER:
-        record_of[OBSERVED] = _user_mcp(module, bridge.path_of(pinned), enabled=True)
-        return record_of, None
     root = bridge.docs_root(_readable(cfg, repo_config))
     if root is None:
         raise Refused(f"[repos.{repo_config.name}] sets mcp = true and none of its readable "
@@ -384,6 +390,23 @@ def _write_mcp_config(run_dir: str, server_config: dict | None) -> None:
     if server_config:
         runstate.write_text(run_dir, MCP_FILE,
                             json.dumps(server_config, indent=2, sort_keys=True) + "\n")
+
+
+def _give_arm(module, run_dir: str, tree: str, mcp: dict | None, server_config: dict | None,
+              pinned: dict | None) -> None:
+    """Write what the arm's client is given — its MCP configuration, and for a client that reads
+    its powers from its home, that home — and check what the client lists from it.
+
+    A client that reads its home is checked for an arm not given the server too: the run's home
+    lists none, and a client listing one anyway is reading servers the harness did not write.
+    """
+    if getattr(module, "MCP_ROUTE", None) != MCP_BY_HOME:
+        _write_mcp_config(run_dir, server_config)
+        return
+    module.write_home(run_dir, worktree=tree, server_config=server_config)
+    observed = _home_mcp(module, run_dir, bridge.path_of(pinned), enabled=bool(mcp))
+    if mcp:
+        mcp[OBSERVED] = observed
 
 
 def _present(**fields) -> dict:
@@ -410,6 +433,7 @@ def cmd_open_run(args) -> int:
     oracle_inputs, task_base = _task_plan(cfg, args.task)
     pinned = _bridge_pin(cfg)
     mcp, server_config = _arm_mcp(cfg, repo_config, arm.adapter, pinned)
+    arm_module = _drive_module(arm.adapter)
 
     # A pull request this run's work becomes carries exactly one `Owner:`, naming the member
     # accountable for it. The manifest is where that line will be built from, so a configuration
@@ -457,7 +481,7 @@ def cmd_open_run(args) -> int:
         # order below is a statement rather than a precedence.
         values.update(_launch_values(arm, args.prompt_file))
         runstate.write_env(run_dir, values)
-        _write_mcp_config(run_dir, server_config)
+        _give_arm(arm_module, run_dir, tree, mcp, server_config, pinned)
         pr_body.prepare(run_dir)
 
         manifest = {
@@ -493,6 +517,10 @@ def cmd_open_run(args) -> int:
         manifest.update(_present(pairing=pairing, prompt_sha256=prompt_sha256,
                                  human_baseline=dict(human_baseline or {}),
                                  oracle_inputs=oracle_inputs, bridge=pinned))
+        # What the arm is allowed, where the run itself holds the grant: a client whose home the
+        # run writes, which `drive` checks still grants it. In the client's own grammar, beside the
+        # server, because two arms of a group are compared only as far as their powers agree.
+        manifest.update(_present(**{PERMISSIONS_KEY: _permissions(arm_module, mcp)}))
         runstate.write_manifest(run_dir, manifest)
     except BaseException:
         runstate.discard(run_dir)
@@ -1063,18 +1091,23 @@ def _tree_of(run_dir: str, worktree_path) -> bool:
 def _mcp_config(module, run_dir: str, manifest: dict) -> str | None:
     """The MCP configuration a pass is given, checked against what the run recorded when it opened.
 
-    A client that takes one per invocation is given the file `open-run` wrote, and one that reads
-    its own configuration has that configuration checked again, because it can have been edited
-    between the run opening and the pass starting.
+    A client that takes one per invocation is given the file `open-run` wrote. One that reads its
+    home has the run's home checked again — what it allows and what servers the client lists from
+    it — because the home is a directory on disk that can have changed between the run opening and
+    the pass starting, and the manifest is what the row says the arm was allowed.
     """
     given = manifest.get(MCP_KEY) or {}
     route = getattr(module, "MCP_ROUTE", None)
-    if route == MCP_BY_USER:
-        observed = _user_mcp(module, bridge.path_of(manifest.get(bridge.MANIFEST_KEY)),
+    if route == MCP_BY_HOME:
+        allowed = manifest.get(PERMISSIONS_KEY)
+        if module.granted(run_dir) != allowed:
+            raise Refused(f"the agy home of run {manifest['run_id']} no longer grants what the run "
+                          f"opened with ({allowed!r}): {module.home(run_dir)}")
+        observed = _home_mcp(module, run_dir, bridge.path_of(manifest.get(bridge.MANIFEST_KEY)),
                              enabled=bool(given))
         opened_with = given.get(OBSERVED)
         if given and observed != opened_with:
-            raise Refused(f"agy's own MCP configuration now lists {observed!r} and the run opened "
+            raise Refused(f"agy now lists {observed!r} under the run's home and the run opened "
                           f"with {opened_with!r}")
         return None
     if not given:

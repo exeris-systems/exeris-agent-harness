@@ -28,17 +28,32 @@
 # and the adapter then falls back to asking the installed program — which succeeds, silently, and
 # records the wrong version. The reader takes a version out of whatever else the line says and
 # refuses a line too long to be one, so a diagnostic banner costs nothing.
+#
+# THE CLIENT RUNS UNDER THE RUN'S OWN HOME. It reads its tool permissions and its MCP servers from
+# files under `$HOME/.gemini/`, and the person's own copies hold whatever they allowed by hand. So
+# `HOME` is pointed at `<run>/agy-home`, which `open-run` wrote with the run's fixed allow-list and
+# its server set and nothing else, and a run directory without one is refused rather than launched
+# under the person's. Only the client's own processes see that `HOME`: git and `gh` read the run's
+# configuration from the variables the run's environment names, never from a home directory. The
+# client signs in through the operating system's keyring, which no home holds.
 set -eu
 
 run_dir="$(dirname "${GIT_CONFIG_GLOBAL:?the run environment has not been sourced}")"
 prompt_file="${EXERIS_PROMPT_FILE:?the task reaches this client on its command line}"
 model="${EXERIS_MODEL_ID:?the provider table declares no model_id}"
+agy_home="${run_dir}/agy-home"
 
-agy --version > "${run_dir}/agy.version" 2>&1 || true
+if [ ! -d "${agy_home}" ]; then
+    echo "exeris-agent: ${agy_home} does not exist; this client runs only under the home the" \
+         "run opened with, never under the person's own" >&2
+    exit 2
+fi
 
-exec agy --output-format stream-json \
-         --model "${model}" \
-         --mode accept-edits \
-         --print="$(cat "${prompt_file}")" \
-         --log-file "${run_dir}/agy.log" \
-         "$@" >> "${run_dir}/agy.jsonl"
+HOME="${agy_home}" agy --version > "${run_dir}/agy.version" 2>&1 || true
+
+exec env HOME="${agy_home}" agy --output-format stream-json \
+                                 --model "${model}" \
+                                 --mode accept-edits \
+                                 --print="$(cat "${prompt_file}")" \
+                                 --log-file "${run_dir}/agy.log" \
+                                 "$@" >> "${run_dir}/agy.jsonl"

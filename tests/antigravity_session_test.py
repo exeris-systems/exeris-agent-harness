@@ -119,6 +119,40 @@ class AgyStreamTest(unittest.TestCase):
         self.assertEqual(1, facts["permission_denials"])
         self.assertEqual("full", facts["capture_level"])
 
+    def _closing(self, entries, **fields):
+        """`entries` with `fields` added to the closing event's result."""
+        out = [dict(entry) for entry in entries]
+        out[-1] = {"event": "result", "result": {**out[-1]["result"], **fields}}
+        return out
+
+    def test_the_actions_a_closing_event_says_were_refused_are_counted(self):
+        denied = [{"action": "command(whoami)", "display_name": "whoami"},
+                  {"action": "command(git push)", "display_name": "git push"}]
+        facts = session.read(str(self._stream(self._closing(self.entries,
+                                                             denied_actions=denied))))
+        self.assertEqual(2, facts["permission_denials"])
+        self.assertEqual("full", facts["capture_level"])
+
+    def test_an_empty_list_of_refused_actions_is_a_count_of_none(self):
+        # The client stated that nothing was refused, which is a measurement — unlike a stream
+        # that says nothing about refusals at all.
+        facts = session.read(str(self._stream(self._closing(self.entries, denied_actions=[]))))
+        self.assertEqual(0, facts["permission_denials"])
+        self.assertEqual("full", facts["capture_level"])
+
+    def test_each_invocation_s_refusals_are_added_and_not_told_twice(self):
+        # Two invocations of one conversation, each ended by a refusal; the second refusal is also
+        # told by a step's state, and is still one refusal.
+        first = self._closing(self.entries, denied_actions=[{"action": "command(whoami)"}])
+        second = self._closing(
+            [*self.entries[:-1],
+             {"event": "step_update", "step_update": {"step_index": 9, "state": "TOOL_DENIED",
+                                                      "step_type": "tool_call"}},
+             self.entries[-1]],
+            denied_actions=[{"action": "command(id)"}])
+        facts = session.read(str(self._stream([*first, *second])))
+        self.assertEqual(2, facts["permission_denials"])
+
     def test_the_step_types_the_stream_used_are_printed_and_recorded_nowhere_else(self):
         # The set of tool step types is unmeasured, so the names are printed beside the run and
         # left out of the row: a count whose meaning is unchecked does not belong in a column.
