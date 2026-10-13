@@ -342,20 +342,28 @@ tools}` (with Antigravity's `observed` listing line beside them) for an arm give
   harness did not write, and the run is refused. `drive` checks the home's grants and the listing
   again before its first pass.
 
-**What a pass is allowed.** Both arms are given one fixed surface. Claude Code's `drive` passes
-get `--allowedTools` with `Read,Edit,Write,Glob,Grep` and `Bash(<command>:*)` for `git add`,
-`git commit`, `git status`, `git diff`, `git log` and `ls`, plus the three server tools for an arm
-given the server. Antigravity's home allows `command(<command>)` for the same six commands and
-for `pwd`, `cat`, `head`, `tail`, `find`, `grep` and `wc` — the commands that stand in for Read,
-Glob and Grep, which that client's model reaches through its shell; the client refuses the forms
-of `find` that write or run something else (`-delete`, `-exec`), and these commands read paths
-outside the tree, which Claude's arm cannot — plus
-`mcp(exeris/docs-list_adrs)`, `mcp(exeris/docs-get_adr)` and `mcp(exeris/docs-search)` for an arm
-given the server, and the manifest records that list as `permissions`, which `drive` checks the
-home still grants before its first pass. Reading and editing need no grant in its accept-edits
-mode, the home keeps `allowNonWorkspaceAccess` off and trusts the run's worktree, and the readable
-directories reach it as `--add-dir`. In print mode a command outside the list is refused and ends the invocation; the
-stream's closing event lists it under `denied_actions`, which the row counts.
+**What a pass is allowed.** Each arm is given a fixed surface, and the two surfaces cover the same
+reading capability. Claude Code's `drive` passes get `--allowedTools` with
+`Read,Edit,Write,Glob,Grep` and `Bash(<command>:*)` for `git add`, `git commit`, `git status`,
+`git diff`, `git log` and `ls`, plus the three server tools for an arm given the server.
+
+Antigravity's home allows `command(<command>)` for the same six commands and for `pwd`, `cat`,
+`head`, `tail`, `find`, `grep` and `wc`, plus `mcp(exeris/docs-list_adrs)`,
+`mcp(exeris/docs-get_adr)` and `mcp(exeris/docs-search)` for an arm given the server. The seven
+stand in for Read, Glob and Grep, which that client's model reaches through its shell. The manifest
+records the list as `permissions`, and `drive` checks the home still grants it before its first
+pass. Reading and editing need no grant in the client's accept-edits mode, the home trusts the
+run's worktree, and the readable directories reach it as `--add-dir`.
+
+Two things about that list are measured rather than assumed. The client refuses every form of
+`find` that writes or runs something else — `-delete`, `-exec`, `-execdir`, `-ok`, `-fprint`,
+`-fprintf` and `-fls` were each refused under it. And the home's `allowNonWorkspaceAccess: false`
+bounds the client's own file tools, not the commands the list grants: `cat`, `grep` and `find` read
+paths outside the tree, which Claude's arm cannot. That outside read is the accepted cost of a list
+this client's model can read the tree with.
+
+In print mode a command outside the list is refused and ends the invocation; the stream's closing
+event lists it under `denied_actions`, which the row counts.
 
 ### The three arms this machine runs
 

@@ -19,8 +19,10 @@ differ in a power neither of them records. So `open-run` writes `<run>/agy-home`
 three files the client reads them from, and the launcher runs the client with `HOME` pointing there:
 
 * `antigravity-cli/settings.json` allows exactly `permissions(mcp=…)` — the git and `ls` commands
-  Claude Code's arm is allowed, and the Exeris server's documentation tools where the arm is given
-  the server — keeps the client inside its workspace, and trusts the run's worktree;
+  Claude Code's arm is allowed, the reading commands `pwd`, `cat`, `head`, `tail`, `find`, `grep`
+  and `wc`, and the Exeris server's documentation tools where the arm is given the server — keeps
+  the client's own file tools inside its workspace, and trusts the run's worktree. The reading
+  commands are not held to the workspace: they read paths outside it;
 * `config/config.json` grants nothing globally, and says its grants are already in the shape the
   client would otherwise migrate them to, so nothing is carried in from elsewhere;
 * `config/mcp_config.json` lists the pinned server for an arm given it and no server for one not.
@@ -70,11 +72,13 @@ MCP_TOOLS = claude_drive.MCP_TOOLS
 #: commands Claude Code's arm is allowed by name, and the read-only commands that stand in for the
 #: built-in Read, Glob and Grep it is allowed as tools — this client's model reads and searches the
 #: tree through its shell, and in print mode a refused command ends the pass, so a list equal by
-#: name would leave it unable to read what Claude's arm reads. The grant is by command name and the
-#: client still refuses the forms of `find` that write or run something else (`-delete`, `-exec`).
-#: What it does not bound is where they read: `cat`, `grep` and `find` reach paths outside the tree,
-#: which Claude's arm, confined to its workspace and readable directories, cannot. Nothing here
-#: writes outside the tree's edits and commits; git may not push, which is the close's.
+#: name would leave it unable to read what Claude's arm reads. The grant is by command name, and the
+#: client refuses each form of `find` that writes or runs something else: `-delete`, `-exec`,
+#: `-execdir`, `-ok`, `-fprint`, `-fprintf` and `-fls` were each tried under this list and refused.
+#: What it does not bound is where these commands read: `cat`, `grep` and `find` reach paths
+#: outside the tree, which Claude's arm, confined to its workspace and readable directories, cannot
+#: — the accepted cost of a list this client's model can read the tree with. Git may not push,
+#: which is the close's.
 COMMANDS = ("git add", "git commit", "git status", "git diff", "git log", "ls",
             "pwd", "cat", "head", "tail", "find", "grep", "wc")
 
@@ -139,7 +143,8 @@ def write_home(run_dir: str, *, worktree: str, server_config: dict | None) -> li
     `server_config` is the one-server configuration the harness gives an arm given the Exeris server
     (`bridge.server_config`), nothing for an arm not given it. The readable directories are not
     here: they reach the client as `--add-dir` on each pass, which is access the client grants
-    without `allowNonWorkspaceAccess`, and that stays off so nothing else outside the workspace is.
+    without `allowNonWorkspaceAccess`. That setting stays off, and it bounds the client's own file
+    tools; the reading commands the list grants are not held to the workspace by it.
     """
     root = home(run_dir)
     os.makedirs(root, mode=_DIR_MODE, exist_ok=False)
