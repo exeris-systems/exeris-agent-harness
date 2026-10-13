@@ -316,8 +316,8 @@ a credential, and the record of a run is not where a credential is kept.
 `[repos.<name>] mcp = true` gives an arm working there the server `[oracle] bridge` pins — the
 same program the oracle reads the registry through, so the arm's context and the instrument's
 judgement come from one build. The manifest records `mcp: {server, bridge: {version, commit},
-tools}` for an arm given it and `mcp: null` for one that is not, and a row whose arm had it sits on
-a `-mcp` fence. How the server reaches the arm is the client's:
+tools}` (with Antigravity's `observed` listing line beside them) for an arm given it and
+`mcp: null` for one that is not, and a row whose arm had it sits on a `-mcp` fence. How the server reaches the arm is the client's:
 
 - **Claude Code** takes it per invocation. `open-run` writes `<run>/mcp.json`, one stdio server
   named `exeris` running `node <bridge>` with `EXERIS_DOCS_ROOT` set to the first `readable`
@@ -328,13 +328,30 @@ a `-mcp` fence. How the server reaches the arm is the client's:
   `mcp__exeris__docs-search` — the name Claude Code gives an MCP tool, `mcp__<server>__<tool>`,
   keeping `-` and `_`. The configuration is given to `drive`'s passes; a person working in a run
   opened with `--launch` works under their own client configuration.
-- **Antigravity** has no per-invocation flag: it reads its own user-level configuration. So the
-  run is checked rather than configured. With `mcp = true`, `open-run` requires `agy mcp list` to
-  show exactly one enabled stdio server whose command is `node <pinned bridge>`, records that line,
-  and otherwise refuses, naming the `agy mcp add` that points it there; with `mcp = false` it
-  refuses where any enabled server is the Exeris bridge, because the arms of a group read through
-  the same context tools. `drive` checks the listing again before its first pass. The client exposes
-  every tool the server lists, which the manifest records as `tools: ["*"]`.
+- **Antigravity** has no per-invocation flag: it reads its MCP servers, and its tool permissions,
+  from files under `$HOME/.gemini/`. A person's own copies hold whatever they allowed while working
+  by hand, so the run gets a home of its own and the person's configuration decides nothing.
+  `open-run` writes `<run>/agy-home` (directories `0700`, files `0600`) holding only
+  `antigravity-cli/settings.json`, `config/config.json` and `config/mcp_config.json`, and the
+  launcher runs the client with `HOME` pointing there — refusing to start it where that directory
+  does not exist. The server file lists the same one-server configuration Claude Code's arm is
+  given, enabled, for `mcp = true`, and no server for `mcp = false`. The client signs in through
+  the operating system's keyring, so no credential is written or copied into the home. `open-run`
+  then runs `agy mcp list` under that home, requires exactly the pinned server (or none), and
+  records the line; a listing that differs means the client is reading servers from somewhere the
+  harness did not write, and the run is refused. `drive` checks the home's grants and the listing
+  again before its first pass.
+
+**What a pass is allowed.** Both arms are given one fixed surface. Claude Code's `drive` passes
+get `--allowedTools` with `Read,Edit,Write,Glob,Grep` and `Bash(<command>:*)` for `git add`,
+`git commit`, `git status`, `git diff`, `git log` and `ls`, plus the three server tools for an arm
+given the server. Antigravity's home allows `command(<command>)` for the same six commands, plus
+`mcp(exeris/docs-list_adrs)`, `mcp(exeris/docs-get_adr)` and `mcp(exeris/docs-search)` for an arm
+given the server, and the manifest records that list as `permissions`, which `drive` checks the
+home still grants before its first pass. Reading and editing need no grant in its accept-edits
+mode, the home keeps `allowNonWorkspaceAccess` off and trusts the run's worktree, and the readable
+directories reach it as `--add-dir`. In print mode a command outside the list is refused and ends the invocation; the
+stream's closing event lists it under `denied_actions`, which the row counts.
 
 ### The three arms this machine runs
 
@@ -380,8 +397,8 @@ everything it does not carry is absent from the row rather than zero:
 | `execution.human_prompts` | `user_input` steps less the one that started the run and less one per oracle round a `drive` sent |
 | `accounting.usage` | the last closing event's input, output and cache-read counts — a resumed conversation's closing event carries the conversation's totals |
 | `execution.wall_time_ms` | the closing event's duration where there is one closing event; with more, the run's own clock |
-| `execution.permission_denials` | steps whose state names a refusal — **absent** where no state in the stream names one |
-| `execution.capture_level` | `full` where a refusal was observed, `counts-only` otherwise |
+| `execution.permission_denials` | the `denied_actions` the closing events list, summed over the invocations, or the steps whose state names a refusal where that is more — **absent** where no closing event carries the list and no state names one |
+| `execution.capture_level` | `full` where the stream states a refusal count, `counts-only` otherwise |
 | `agent.system_prompt_sha256` | the `--prompt-file` the harness passed, composed as for every other arm |
 
 The tool step types are unmeasured: the client names them as it likes, so they are counted rather

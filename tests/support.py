@@ -17,7 +17,8 @@ text only: a real session line is content, and content does not enter this repos
 
 Only `gh` and `agy` are substituted, and they are substituted as programs on the path rather than
 inside the harness, so what a case asserts is the request that left the process — and, for `agy`,
-the user-level MCP configuration it lists, which is the machine's and never the case's to inherit.
+the MCP servers it lists from the home it runs under, which for a run is the run's own and never
+the person's.
 """
 
 import datetime
@@ -276,9 +277,21 @@ class HarnessFixture(unittest.TestCase):
         (self.bin / "agy").chmod(0o755)
 
     def agy_servers(self, *lines):
-        """The servers the stand-in `agy mcp list` reports, one listing line each."""
+        """Servers the stand-in `agy mcp list` reports beside those of the home it runs under —
+        ones the client would find somewhere other than that home — one listing line each."""
         (self.bin / "agy-mcp-list").write_text("".join(f"{line}\n" for line in lines),
                                                encoding="utf-8")
+
+    def person_agy_config(self, servers, allow=()):
+        """The person's own agy configuration, under the fixture's `HOME`: the servers it lists,
+        and the commands it allows."""
+        gemini = self.home / ".gemini"
+        (gemini / "config").mkdir(parents=True, exist_ok=True)
+        (gemini / "antigravity-cli").mkdir(parents=True, exist_ok=True)
+        (gemini / "config" / "mcp_config.json").write_text(
+            json.dumps({"mcpServers": servers}), encoding="utf-8")
+        (gemini / "antigravity-cli" / "settings.json").write_text(
+            json.dumps({"permissions": {"allow": list(allow)}}), encoding="utf-8")
 
     def _clone_of(self, name, seed):
         """A working clone of a fresh bare origin, seeded by `seed(directory)`."""

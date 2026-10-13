@@ -11,13 +11,30 @@ from the previous invocation's, which is what lets the reader count the whole co
 session. A stream that names no conversation leaves no way to resume the same one, and the loop is
 refused rather than continued in a new session.
 
-**MCP, from the user's own configuration.** This client takes no MCP configuration per invocation;
-it reads the servers its user-level configuration lists, which `agy mcp list` prints. So the
-harness cannot give an arm the Exeris server — it can only establish, when the run opens, that the
-server the client will start is the pinned one, and refuse the run where it is not. An arm not
-given the server is held to the converse: no enabled server of the Exeris bridge, so that two arms
-of a group read through the same context tools or through none. The client exposes every tool the
-server lists; there is no per-tool allowance to narrow it by.
+**Powers and servers, from a home of the run's own.** This client takes neither its tool
+permissions nor its MCP servers per invocation: it reads both from files under `$HOME/.gemini/`,
+which on a person's machine hold whatever that person allowed while working with it by hand. A run
+under that home would be allowed what the person happened to allow, and two arms of a group would
+differ in a power neither of them records. So `open-run` writes `<run>/agy-home`, holding only the
+three files the client reads them from, and the launcher runs the client with `HOME` pointing there:
+
+* `antigravity-cli/settings.json` allows exactly `permissions(mcp=…)` — the git and `ls` commands
+  Claude Code's arm is allowed, and the Exeris server's documentation tools where the arm is given
+  the server — keeps the client inside its workspace, and trusts the run's worktree;
+* `config/config.json` grants nothing globally, and says its grants are already in the shape the
+  client would otherwise migrate them to, so nothing is carried in from elsewhere;
+* `config/mcp_config.json` lists the pinned server for an arm given it and no server for one not.
+
+Reading and editing need no grant in the client's accept-edits mode. A command outside the list is
+refused, and in print mode the refusal also ends the invocation, which the stream's closing event
+records. The client signs in through the operating system's keyring, not through a file under its
+home, so no credential is written or copied here.
+
+What the client lists from that home is checked when the run opens and again before `drive`'s first
+pass, with `agy mcp list` run under the same `HOME`: exactly the pinned server for an arm given it,
+none for an arm not. The harness wrote the file the listing comes from, so a listing that differs
+says the client read its servers from somewhere other than that home, and the run is refused rather
+than driven under a server set nobody recorded.
 """
 
 import json
@@ -25,6 +42,7 @@ import os
 import re
 import subprocess
 
+from adapters.claude import drive as claude_drive
 from harness import bridge
 
 #: The file the launcher appends the client's events to, inside the run's directory.
@@ -41,11 +59,26 @@ CONVERSATION_ID = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
-#: How this client is given an MCP server: its user-level configuration, checked when a run opens.
-MCP_ROUTE = "user"
+#: How this client is given an MCP server: a home of the run's own, written when the run opens.
+MCP_ROUTE = "home"
 
-#: The server's tools an arm given it may use: every one it lists, since the client allows no fewer.
-MCP_TOOLS = ("*",)
+#: The server's tools an arm given it may use: the documentation family, read-only — the same three
+#: Claude Code's arm is allowed, so that the two arms of a group read through the same tools.
+MCP_TOOLS = claude_drive.MCP_TOOLS
+
+#: The commands a pass may run without asking: the ones Claude Code's arm is allowed. Git may read
+#: and commit; it may not push, which is the close's.
+COMMANDS = ("git add", "git commit", "git status", "git diff", "git log", "ls")
+
+#: The run's own home for this client, inside the run's directory, and the three files under it.
+HOME = "agy-home"
+SETTINGS = (".gemini", "antigravity-cli", "settings.json")
+GRANTS = (".gemini", "config", "config.json")
+MCP_CONFIG = (".gemini", "config", "mcp_config.json")
+
+#: The modes the home is written with: it is the run's, and nobody else's to read.
+_DIR_MODE = 0o700
+_FILE_MODE = 0o600
 
 #: The listing of the client's configured servers, with a program named by constant.
 MCP_LIST = ("agy", "mcp", "list")
@@ -57,14 +90,73 @@ _LINE = "line"
 #: The first column of the listing's heading line.
 _HEADING = "NAME"
 
-#: What marks a configured server as the Exeris bridge other than running the pinned path: a name
-#: that says so, or a command that runs the bridge's package from wherever it was checked out.
-_BRIDGE_NAME = "exeris"
-_BRIDGE_PACKAGE = "exeris-ai-bridge"
-
 
 class McpRefused(Exception):
-    """The client's configured servers are not the ones the arm's table says it has."""
+    """The client's configured servers are not the ones the run's home gives it."""
+
+
+def permissions(*, mcp: bool) -> list[str]:
+    """The client's allow-list for a pass, in its own grammar: `command(…)` and `mcp(<server>/…)`.
+
+    Fixed, because a pass nobody sits at has nobody to ask, and a surface that varied between rounds
+    or between runs would make two rows differ in a property neither of them records.
+    """
+    allow = [f"command({command})" for command in COMMANDS]
+    if mcp:
+        allow += [f"mcp({bridge.SERVER}/{tool})" for tool in MCP_TOOLS]
+    return allow
+
+
+def home(run_dir: str) -> str:
+    """The run's own home for this client."""
+    return os.path.join(run_dir, HOME)
+
+
+def _write(root: str, parts: tuple, value: dict) -> None:
+    directory = root
+    for part in parts[:-1]:
+        directory = os.path.join(directory, part)
+        os.makedirs(directory, mode=_DIR_MODE, exist_ok=True)
+        os.chmod(directory, _DIR_MODE)
+    target = os.path.join(directory, parts[-1])
+    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _FILE_MODE)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    os.chmod(target, _FILE_MODE)
+
+
+def write_home(run_dir: str, *, worktree: str, server_config: dict | None) -> list[str]:
+    """Write the run's home for this client and return the allow-list it grants.
+
+    `server_config` is the one-server configuration the harness gives an arm given the Exeris server
+    (`bridge.server_config`), nothing for an arm not given it. The readable directories are not
+    here: they reach the client as `--add-dir` on each pass, which is access the client grants
+    without `allowNonWorkspaceAccess`, and that stays off so nothing else outside the workspace is.
+    """
+    root = home(run_dir)
+    os.makedirs(root, mode=_DIR_MODE, exist_ok=False)
+    os.chmod(root, _DIR_MODE)
+    allow = permissions(mcp=bool(server_config))
+    _write(root, SETTINGS, {"permissions": {"allow": allow},
+                            "allowNonWorkspaceAccess": False,
+                            "trustedWorkspaces": [worktree]})
+    _write(root, GRANTS, {"userSettings": {"globalPermissionGrants": {"allow": []},
+                                           "permissionGrantsV2Migrated": True}})
+    servers = {}
+    for name, server in ((server_config or {}).get("mcpServers") or {}).items():
+        servers[name] = {**server, "disabled": False}
+    _write(root, MCP_CONFIG, {"mcpServers": servers})
+    return allow
+
+
+def granted(run_dir: str) -> list[str] | None:
+    """The allow-list the run's home grants now, or nothing where it cannot be read as one."""
+    try:
+        with open(os.path.join(home(run_dir), *SETTINGS), encoding="utf-8") as handle:
+            allow = (json.load(handle).get("permissions") or {}).get("allow")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return allow if isinstance(allow, list) else None
 
 
 def mcp_servers(listing: str) -> list[dict]:
@@ -83,15 +175,15 @@ def mcp_servers(listing: str) -> list[dict]:
     return out
 
 
-def _is_bridge(server: dict, pinned: str | None) -> bool:
-    runs = server[_COMMAND]
-    return (_BRIDGE_NAME in server["name"].lower() or _BRIDGE_PACKAGE in runs
-            or bool(pinned and pinned in runs))
-
-
-def _listing() -> str:
+def _listing(run_dir: str) -> str:
+    """What the client lists under the run's home, never under the person's."""
+    root = home(run_dir)
+    if not os.path.isdir(root):
+        raise McpRefused(f"the run has no home for agy to read its servers from: {root}")
+    environment = {**os.environ, "HOME": root}
     try:
-        done = subprocess.run(list(MCP_LIST), capture_output=True, text=True, timeout=60)
+        done = subprocess.run(list(MCP_LIST), capture_output=True, text=True, timeout=60,
+                              env=environment)
     except (OSError, subprocess.SubprocessError) as exc:
         raise McpRefused(f"`{' '.join(MCP_LIST)}` could not be run: {exc}") from None
     if done.returncode:
@@ -99,39 +191,37 @@ def _listing() -> str:
     return done.stdout
 
 
-def mcp_state(pinned: str | None, *, enabled: bool) -> str | None:
+def mcp_state(run_dir: str, pinned: str | None, *, enabled: bool) -> str | None:
     """The server line an arm given the bridge will start, or nothing for an arm not given it.
 
-    Given the bridge: exactly one enabled stdio server whose command is `node <pinned path>` must
-    be listed, and its line is the answer. Not given it: no enabled server that is the Exeris
-    bridge may be listed. Either way anything else is `McpRefused`, naming how to put it right.
+    Read under the run's home, whose server file the harness wrote. Given the bridge: the listing
+    is exactly one enabled stdio server whose command is `node <pinned path>`, and its line is the
+    answer. Not given it: the listing is empty. Anything else is `McpRefused`, because the client
+    then reads its servers from somewhere the harness did not write.
     """
-    servers = [server for server in mcp_servers(_listing()) if server["status"] == "enabled"]
+    servers = mcp_servers(_listing(run_dir))
+    lines = "; ".join(server[_LINE] for server in servers) or "no server"
     if not enabled:
-        found = [server[_LINE] for server in servers if _is_bridge(server, pinned)]
-        if found:
-            raise McpRefused(f"this arm is not given the Exeris MCP server and agy's own "
-                             f"configuration enables it ({'; '.join(found)}); the arms of a group "
-                             f"read through the same context tools — disable it with "
-                             f"`agy mcp disable <name>`, or set mcp = true for the repository")
+        if servers:
+            raise McpRefused(f"this arm is not given the Exeris MCP server and agy, under the "
+                             f"run's own home, lists {lines}; the home lists none, so agy is "
+                             f"reading its servers from somewhere else")
         return None
     wanted = bridge.command(pinned)
-    found = [server[_LINE] for server in servers
-             if server["type"] == "stdio" and server[_COMMAND] == wanted]
-    if len(found) != 1:
-        raise McpRefused(f"this arm is given the Exeris MCP server and agy's own configuration "
-                         f"enables {len(found)} stdio server(s) running `{wanted}`; agy takes no "
-                         f"MCP server per invocation, so point it at the pinned one: `agy mcp add "
-                         f"--env {bridge.DOCS_ROOT_VARIABLE}=<docs root> --env "
-                         f"{bridge.MODE_VARIABLE}={bridge.MODE} {bridge.SERVER} {wanted}`")
-    return found[0]
+    if (len(servers) != 1 or servers[0]["status"] != "enabled"
+            or servers[0]["type"] != "stdio" or servers[0][_COMMAND] != wanted):
+        raise McpRefused(f"this arm is given the Exeris MCP server and agy, under the run's own "
+                         f"home, lists {lines}; the home lists exactly one enabled stdio server "
+                         f"running `{wanted}`, so agy is not reading the servers the harness "
+                         f"wrote for it")
+    return servers[0][_LINE]
 
 
 def arguments(*, readable, resume: str | None, mcp_config: str | None = None) -> list[str]:
     """What follows the launcher: the readable directories, and the conversation to continue.
 
     The prompt is not here; see `PROMPT`. `mcp_config` is accepted and unused: this client reads
-    its servers from its own configuration, which `mcp_state` checked when the run opened.
+    its servers, and its permissions, from the run's own home, which the launcher points it at.
     """
     argv = []
     for directory in readable:

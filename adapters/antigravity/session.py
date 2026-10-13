@@ -9,7 +9,8 @@ Three event shapes carry everything the row needs. `init` opens the session and 
 `step_update` reports one step of the session as its state moves — a step reaches the stream more
 than once, so the steps are counted by their index and never by their updates. `result` closes the
 session with the client's own totals: the turns it took, the tokens it spent and the time the work
-took.
+took — and, where an action outside the run's allow-list was refused, `denied_actions`, one entry
+per refusal.
 
 Everything below is read and nothing is written. What the stream does not carry is absent from the
 row, never zero: a count the client does not report and a count of nothing are two different
@@ -206,6 +207,7 @@ class _Tally:
         self.invocation = 0
         self.opened_by: dict[object, int] = {}
         self.conversations: set[str] = set()
+        self.denied_actions: int | None = None
 
     def add(self, entry: dict) -> None:
         self.event_count += 1
@@ -220,6 +222,18 @@ class _Tally:
         elif event == "result" and isinstance(entry.get("result"), dict):
             self.result = entry["result"]
             self.results += 1
+            self._denied(self.result.get("denied_actions"))
+
+    def _denied(self, actions) -> None:
+        """Add the actions one invocation's closing event says were refused.
+
+        In print mode a refusal ends the invocation it happened in, so each closing event lists the
+        refusals of its own invocation and the conversation's are their sum. A closing event that
+        carries the list, empty or not, is the client stating a count; one that carries none states
+        nothing, and leaves the count as it was.
+        """
+        if isinstance(actions, list):
+            self.denied_actions = (self.denied_actions or 0) + len(actions)
 
     def _init(self, entry: dict) -> None:
         self.invocation += 1
@@ -304,15 +318,22 @@ class _Tally:
     def tool_calls(self) -> int:
         return sum(1 for kind in self.steps.values() if kind and kind not in CONVERSATION)
 
-    def denials(self) -> int:
-        """Steps whose state names a refusal.
+    def denials(self) -> int | None:
+        """The refusals the stream states, or nothing where it states none.
 
-        Where no state in the stream names one, the caller states the count as absent rather than
-        zero: this client's state vocabulary is unmeasured, and a run nothing refused must not read
-        the same as a run whose refusals nobody could see.
+        Two places can say a refusal happened: the `denied_actions` a closing event lists, and a
+        step whose state names one. Where the closing events carry the list, the count is the larger
+        of the two — the same refusal may be told both ways, and counting it twice would report
+        more refusals than the run had. Where no closing event carries one, the steps are all there
+        is, and a stream none of whose states names a refusal states no count: this client's state
+        vocabulary is unmeasured, and a run nothing refused must not read the same as a run whose
+        refusals nobody could see.
         """
-        return sum(1 for seen in self.states.values()
-                   if any(_DENIAL.search(state) for state in seen))
+        stepped = sum(1 for seen in self.states.values()
+                      if any(_DENIAL.search(state) for state in seen))
+        if self.denied_actions is None:
+            return stepped or None
+        return max(self.denied_actions, stepped)
 
     def wall_time_ms(self, result: dict) -> int | None:
         """The closing event's duration, where exactly one closing event was written."""
@@ -373,12 +394,12 @@ def read(path: str, *, oracle_prompts=()) -> dict:
         # a run asked once and left to finish is `0` rather than `1`. The oracle's prompts are the
         # instrument's and are not steering.
         "human_prompts": max(prompts - 1 - len(oracle_prompts), 0),
-        "permission_denials": denials or None,
+        "permission_denials": denials,
         # The stream carries no prompt text. The digest of what instructed the run comes from the
         # file the harness passed the client, which is why this adapter cannot be run without one.
         "system_prompt_sha256": None,
-        # `full` only where every optional count came from the stream. Without a refusal in it,
-        # one of them did not, and the row says so rather than claiming the level.
-        "capture_level": "full" if denials else "counts-only",
+        # `full` only where every optional count came from the stream. Without a refusal count in
+        # it, one of them did not, and the row says so rather than claiming the level.
+        "capture_level": "full" if denials is not None else "counts-only",
         "notes": notes,
     }
