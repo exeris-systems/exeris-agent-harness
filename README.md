@@ -342,16 +342,51 @@ tools}` (with Antigravity's `observed` listing line beside them) for an arm give
   harness did not write, and the run is refused. `drive` checks the home's grants and the listing
   again before its first pass.
 
-**What a pass is allowed.** Both arms are given one fixed surface. Claude Code's `drive` passes
-get `--allowedTools` with `Read,Edit,Write,Glob,Grep` and `Bash(<command>:*)` for `git add`,
-`git commit`, `git status`, `git diff`, `git log` and `ls`, plus the three server tools for an arm
-given the server. Antigravity's home allows `command(<command>)` for the same six commands, plus
-`mcp(exeris/docs-list_adrs)`, `mcp(exeris/docs-get_adr)` and `mcp(exeris/docs-search)` for an arm
-given the server, and the manifest records that list as `permissions`, which `drive` checks the
-home still grants before its first pass. Reading and editing need no grant in its accept-edits
-mode, the home keeps `allowNonWorkspaceAccess` off and trusts the run's worktree, and the readable
-directories reach it as `--add-dir`. In print mode a command outside the list is refused and ends the invocation; the
-stream's closing event lists it under `denied_actions`, which the row counts.
+**What a pass is allowed.** Each arm is given a fixed surface. Claude Code's `drive` passes get `--allowedTools` with
+`Read,Edit,Write,Glob,Grep` and `Bash(<command>:*)` for `git add`, `git commit`, `git status`,
+`git diff`, `git log` and `ls`, plus the three server tools for an arm given the server.
+
+Antigravity's home allows `command(<command>)` for the same six commands and for `pwd`, `cat`,
+`head`, `tail`, `find`, `grep` and `wc`, for the read-only git commands `git show`,
+`git rev-parse` and `git ls-files`, and for `which`, plus `mcp(exeris/docs-list_adrs)`,
+`mcp(exeris/docs-get_adr)` and `mcp(exeris/docs-search)` for an arm given the server. These stand
+in for Read, Glob and Grep, which that client's model reaches through its shell, and in print mode
+each command it is refused ends its pass. `git config` and `git branch` are not granted: the first
+can unset the hook that stamps `Exeris-Run:`, the second can delete branches in the clone whose git
+directory the sandbox mounts writable. The manifest
+records the list as `permissions`, and `drive` checks the home still grants it before its first
+pass. Reading and editing need no grant in the client's accept-edits mode, the home trusts the
+run's worktree, and the readable directories reach it as `--add-dir`.
+
+The client refuses the forms of `find` that write or run another program (`-delete`, `-exec`,
+`-execdir`, `-ok`, `-fprint`, `-fprintf`, `-fls`). The home's `allowNonWorkspaceAccess: false`
+bounds the client's own file tools, not the commands the list grants; those are confined by the
+launcher, which runs the client under bubblewrap (`adapters/antigravity/sandbox.py`). The root is
+mounted read-only; the home, `/tmp`, the directory of runs (this run's and every other) and the
+user's runtime directory are emptied;
+then the worktree, the client's own home and the worktree's git directory are mounted back
+read-write, with the clone's configuration and hooks and the worktree's own configuration read-only
+over it, so that no `core.hooksPath` set from inside stops the hook that stamps `Exeris-Run:`. The
+run's git configuration and hooks, the readable directories, the pinned server, its documentation
+root and the directories of the client's and the server's programs are mounted read-only. The
+session bus socket, which the keyring sign-in uses, is bound read-write on its own. The App's
+private key and its age identity are covered by an empty file wherever they are configured.
+
+The environment is narrowed to `KEPT_ENVIRONMENT` in `sandbox.py` — `PATH`, the locale, terminal
+and user, the session bus and runtime directory, the run's git identity, configuration and transport
+closures, and `EXERIS_RUN`. Bubblewrap itself is started with those variables alone, without
+`HOME`; the client gets them again after `--clearenv`, with `HOME` set to its own home. Neither
+process holds `GH_TOKEN`, so it cannot be read from `/proc`.
+
+What this hides is the person's and the run's secrets: the installation token and the run's
+environment file, the App's key, the person's `gh` and git credentials, other runs and other
+worktrees. It does not hide the operating system's own files — `/etc`, `/usr` and any path outside
+the home, `/tmp` and the directory of runs stay readable, which Claude's arm, confined to its workspace
+and readable directories, does not reach. A machine without `bwrap`, or without the configuration
+that names the key, does not run this arm.
+
+In print mode a command outside the list is refused and ends the invocation; the stream's closing
+event lists it under `denied_actions`, which the row counts.
 
 ### The three arms this machine runs
 

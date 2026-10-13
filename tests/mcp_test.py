@@ -44,7 +44,10 @@ EXPECTED_TOOLS = ["mcp__exeris__docs-list_adrs", "mcp__exeris__docs-get_adr",
 #: What the Antigravity arm's home allows, in that client's grammar: Claude Code's commands, and
 #: the same three server tools where the arm is given the server.
 AGY_COMMANDS = ["command(git add)", "command(git commit)", "command(git status)",
-                "command(git diff)", "command(git log)", "command(ls)"]
+                "command(git diff)", "command(git log)", "command(ls)", "command(pwd)",
+                "command(cat)", "command(head)", "command(tail)", "command(find)", "command(grep)",
+                "command(wc)", "command(git show)", "command(git rev-parse)",
+                "command(git ls-files)", "command(which)"]
 AGY_MCP = ["mcp(exeris/docs-list_adrs)", "mcp(exeris/docs-get_adr)", "mcp(exeris/docs-search)"]
 
 MCP_FENCE = support.FENCE.replace("harness-claude-", "harness-claude-mcp-")
@@ -216,13 +219,25 @@ class AntigravityMcpTest(McpFixture):
         self.assertIsNone(manifest["mcp"])
         self.assertEqual(AGY_COMMANDS, manifest["permissions"])
 
-    def test_the_allow_list_is_the_one_the_other_arm_is_given(self):
+    def test_the_allow_list_is_the_other_arm_s_commands_and_the_reading_stand_ins(self):
         self.assertEqual(AGY_COMMANDS + AGY_MCP, agy_drive.permissions(mcp=True))
         self.assertEqual(list(claude_drive.MCP_TOOLS), list(agy_drive.MCP_TOOLS))
-        commands = [entry[len("Bash("):-len(":*)")] for entry
-                    in claude_drive.ALLOWED_TOOLS.split(",") if entry.startswith("Bash(")]
+        tools = claude_drive.ALLOWED_TOOLS.split(",")
+        commands = [entry[len("Bash("):-len(":*)")] for entry in tools if entry.startswith("Bash(")]
+        granted = agy_drive.permissions(mcp=False)
+        # The other arm's commands, by name and in its order, come first.
         self.assertEqual([f"command({command})" for command in commands],
-                         agy_drive.permissions(mcp=False))
+                         granted[:len(commands)])
+        # The rest stand in for the reading tools the other arm is given as tools: commands that
+        # read. Neither `git config` nor `git branch` is among them: the first can unset the hook
+        # that stamps the run's commits, the second can delete branches in the shared clone.
+        self.assertLessEqual({"Read", "Glob", "Grep"}, set(tools))
+        self.assertFalse({"command(git config)", "command(git branch)"} & set(granted), granted)
+        self.assertEqual(["command(pwd)", "command(cat)", "command(head)", "command(tail)",
+                          "command(find)", "command(grep)", "command(wc)",
+                          "command(git show)", "command(git rev-parse)", "command(git ls-files)",
+                          "command(which)"],
+                         granted[len(commands):])
 
     def test_the_person_s_own_configuration_decides_nothing(self):
         # Servers and grants a person configured by hand, the bridge among them: none of them

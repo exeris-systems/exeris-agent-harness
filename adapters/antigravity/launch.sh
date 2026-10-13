@@ -16,8 +16,9 @@
 # the last invocation's alone. A run's directory starts without the file, so a single pass writes
 # exactly what it always did.
 #
-# `--log-file` is the client's own diagnostic log and is not that stream. It is kept beside the run
-# so that a failure to produce a stream has somewhere to be read from, and it is never carried.
+# `--log-file` is the client's own diagnostic log and is not that stream. It is kept in the client's
+# own home, the one place under the run the confined client can write, so that a failure to produce
+# a stream has somewhere to be read from, and it is never carried.
 #
 # The version is captured here rather than at close, because the version that ran is the version
 # that was installed when it ran, and a client upgraded between the run and its record would
@@ -36,6 +37,15 @@
 # under the person's. Only the client's own processes see that `HOME`: git and `gh` read the run's
 # configuration from the variables the run's environment names, never from a home directory. The
 # client signs in through the operating system's keyring, which no home holds.
+#
+# THE CLIENT RUNS CONFINED. Its model reads through shell commands granted by name, and a command
+# granted by name reads any path the person can. `sandbox.py` runs it under bubblewrap over a
+# read-only root with the home, /tmp, the directory of runs and the user's runtime directory emptied,
+# the worktree, the readable directories, the run's git configuration and hooks and the client's own
+# home mounted back, the App's key covered wherever it is configured, and only the kept variables of
+# the environment passed in: the run's token, its environment file and the person's credentials are
+# not there to be read. The redirection and the version probe stay outside, where the run's directory
+# is. Without bubblewrap, or without the configuration that names the key, the client is not started.
 set -eu
 
 run_dir="$(dirname "${GIT_CONFIG_GLOBAL:?the run environment has not been sourced}")"
@@ -49,11 +59,18 @@ if [ ! -d "${agy_home}" ]; then
     exit 2
 fi
 
+if ! command -v bwrap > /dev/null 2>&1; then
+    echo "exeris-agent: bwrap is not on PATH; this client's reading commands reach any path they" \
+         "are given, and it runs only confined to the run's tree, never without" >&2
+    exit 2
+fi
+
 HOME="${agy_home}" agy --version > "${run_dir}/agy.version" 2>&1 || true
 
-exec env HOME="${agy_home}" agy --output-format stream-json \
-                                 --model "${model}" \
-                                 --mode accept-edits \
-                                 --print="$(cat "${prompt_file}")" \
-                                 --log-file "${run_dir}/agy.log" \
-                                 "$@" >> "${run_dir}/agy.jsonl"
+exec python3 "$(dirname "$0")/sandbox.py" "${run_dir}" -- \
+        agy --output-format stream-json \
+            --model "${model}" \
+            --mode accept-edits \
+            --print="$(cat "${prompt_file}")" \
+            --log-file "${agy_home}/agy.log" \
+            "$@" >> "${run_dir}/agy.jsonl"

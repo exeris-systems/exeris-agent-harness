@@ -28,6 +28,15 @@ jobs:
         with: { repository: exeris-systems/exeris-ai-execution, path: _execution }
       - uses: actions/setup-python@v7
         with: { python-version: '3.14' }
+      # The Antigravity arm runs only under bubblewrap, and its sandbox cases build that namespace for
+      # real; without it they skip. The hosted image ships without it and restricts unprivileged user
+      # namespaces through AppArmor, so both are put right for this job only.
+      - name: bubblewrap, which the Antigravity arm's sandbox cases run under
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          bwrap --ro-bind / / true
       - name: Every rule of the harness, as a case that can fail
         env:
           EXERIS_EXECUTION_REPO: ${{ github.workspace }}/_execution
