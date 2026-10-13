@@ -70,8 +70,11 @@ MCP_TOOLS = claude_drive.MCP_TOOLS
 #: commands Claude Code's arm is allowed by name, and the read-only commands that stand in for the
 #: built-in Read, Glob and Grep it is allowed as tools — this client's model reads and searches the
 #: tree through its shell, and in print mode a refused command ends the pass, so a list equal by
-#: name would leave it unable to read what Claude's arm reads. Nothing here writes outside the
-#: tree's edits and commits; git may not push, which is the close's.
+#: name would leave it unable to read what Claude's arm reads. The grant is by command name and the
+#: client still refuses the forms of `find` that write or run something else (`-delete`, `-exec`).
+#: What it does not bound is where they read: `cat`, `grep` and `find` reach paths outside the tree,
+#: which Claude's arm, confined to its workspace and readable directories, cannot. Nothing here
+#: writes outside the tree's edits and commits; git may not push, which is the close's.
 COMMANDS = ("git add", "git commit", "git status", "git diff", "git log", "ls",
             "pwd", "cat", "head", "tail", "find", "grep", "wc")
 

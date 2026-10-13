@@ -227,8 +227,8 @@ class AntigravityMcpTest(McpFixture):
         # The other arm's commands, by name and in its order, come first.
         self.assertEqual([f"command({command})" for command in commands],
                          granted[:len(commands)])
-        # The rest stand in for the reading tools the other arm is given as tools, and are only
-        # ever read-only: a command that writes would be a power the other arm does not have.
+        # The rest stand in for the reading tools the other arm is given as tools: commands that
+        # read, the forms of `find` that write being refused by the client rather than by this list.
         self.assertTrue({"Read", "Glob", "Grep"} <= set(tools), tools)
         self.assertEqual(["command(pwd)", "command(cat)", "command(head)", "command(tail)",
                           "command(find)", "command(grep)", "command(wc)"],
