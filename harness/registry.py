@@ -86,12 +86,26 @@ def _document(root: str, task: str) -> tuple[dict, bytes, str]:
     return document, body, path
 
 
+def plan(root: str, task: str) -> dict:
+    """`{"oracle_inputs", "base"}` for a `reg:` task, from ONE read of its record.
+
+    The digest recorded in `oracle_inputs` and the base the run starts from describe the same bytes:
+    two reads of a record edited between them would record a digest of one plan and start the run
+    from another.
+    """
+    document, body, path = _document(root, task)
+    return {"oracle_inputs": _inputs(document, body, path), "base": _base(document, path)}
+
+
 def task_base(root: str, task: str) -> str | None:
     """The commit a registered task names as every arm's starting point, or nothing.
 
     `RegistryError` where the record cannot be read or names a base that is not a full commit id.
     """
-    document, _body, path = _document(root, task)
+    return plan(root, task)["base"]
+
+
+def _base(document: dict, path: str) -> str | None:
     base = document.get("base")
     if base is None:
         return None
@@ -106,7 +120,10 @@ def oracle_inputs(root: str, task: str) -> dict:
     The task's record has to name itself by the id the run was opened with: a file that answers to
     another id is another task's plan.
     """
-    document, body, path = _document(root, task)
+    return plan(root, task)["oracle_inputs"]
+
+
+def _inputs(document: dict, body: bytes, path: str) -> dict:
     patterns = _preserve(document, path)
     return {"task_sha256": hashlib.sha256(body).hexdigest(),
             "preserve": patterns,

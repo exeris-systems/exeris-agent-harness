@@ -12,6 +12,7 @@ planned against and every arm starts there. The cases pin what has to hold:
 """
 
 import contextlib
+import hashlib
 import io
 import json
 import pathlib
@@ -102,6 +103,44 @@ class TaskBaseTest(support.HarnessFixture):
                 self.assertNotEqual(0, self._open())
                 self.assertIn("base is not a full commit id", self.said)
                 self.assertEqual([], self._runs())
+
+    def test_a_well_formed_base_absent_from_the_clone_is_refused(self):
+        self._task(base="0" * 40)
+        self.assertNotEqual(0, self._open())
+        self.assertIn("is not in", self.said)
+        self.assertIn("fetch it first", self.said)
+        self.assertEqual([], self._runs())
+
+    def _baseline(self):
+        said = io.StringIO()
+        with contextlib.redirect_stderr(said), contextlib.redirect_stdout(io.StringIO()):
+            code = self.cli(["baseline", "--repo", str(self.clone), "--task", support.TASK,
+                             "--group", "G-0001", "--scope", support.SCOPE])
+        self.said = said.getvalue()
+        return code
+
+    def test_the_human_arm_starts_from_the_task_s_base_too(self):
+        self._task(base=self.planned)
+        self.assertEqual(0, self._baseline(), self.said)
+        self.assertEqual(self.planned, self.manifest("baseline")["base_sha"])
+        head = self.git("rev-parse", "HEAD", cwd=self.worktree("baseline")).stdout.strip()
+        self.assertEqual(self.planned, head)
+        self.assertFalse((self.worktree("baseline") / "LANDED.md").exists())
+
+    def test_the_human_arm_of_a_task_with_an_unusable_base_is_not_opened(self):
+        for base in ("0" * 40, "main"):
+            with self.subTest(base=base):
+                self._task(base=base)
+                self.assertNotEqual(0, self._baseline())
+                self.assertEqual([], self._runs())
+
+    def test_the_digest_and_the_base_come_from_one_read_of_the_record(self):
+        path = self._task(base=self.planned)
+        root = str(path.parent.parent.parent)
+        planned = registry.plan(root, support.TASK)
+        self.assertEqual(self.planned, planned["base"])
+        self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(),
+                         planned["oracle_inputs"]["task_sha256"])
 
     def test_the_registry_reads_the_base_and_nothing_where_there_is_none(self):
         path = self._task(base=self.planned)

@@ -310,35 +310,22 @@ MCP_KEY = "mcp"
 OBSERVED = "observed"
 
 
-def _oracle_inputs(cfg, task: str) -> dict | None:
-    """What a registered task tells the oracle, read from the registry where one is configured.
+def _task_plan(cfg, task: str) -> tuple[dict | None, str | None]:
+    """`(oracle inputs, base)` of a registered task, from one read of its record.
 
     Nothing for an `adhoc:` run, which has no task record, and nothing where no registry is
     configured. A configured registry that cannot answer for a `reg:` task refuses the run: it
-    would otherwise be judged with less than its task said.
+    would otherwise be judged with less than its task said, or start from somewhere the task did
+    not plan.
     """
     if not cfg.registry_path or not task.startswith(registry.PREFIX):
-        return None
+        return None, None
     try:
-        return registry.oracle_inputs(cfg.registry_path, task)
+        planned = registry.plan(cfg.registry_path, task)
     except registry.RegistryError as exc:
-        raise Refused(f"{exc}; [registry] path is configured, and a registered run is judged with "
-                      f"what its task says or is not opened") from None
-
-
-def _task_base(cfg, task: str) -> str | None:
-    """The commit a registered task starts every arm from, or nothing.
-
-    Read from the same record as the oracle inputs and refused the same way: a run of a task that
-    names a base it cannot read would start from somewhere the task did not plan.
-    """
-    if not cfg.registry_path or not task.startswith(registry.PREFIX):
-        return None
-    try:
-        return registry.task_base(cfg.registry_path, task)
-    except registry.RegistryError as exc:
-        raise Refused(f"{exc}; [registry] path is configured, and a registered run starts where "
-                      f"its task says or is not opened") from None
+        raise Refused(f"{exc}; [registry] path is configured, and a registered run is judged and "
+                      f"started as its task says or is not opened") from None
+    return planned["oracle_inputs"], planned["base"]
 
 
 def _bridge_pin(cfg) -> dict | None:
@@ -420,8 +407,7 @@ def cmd_open_run(args) -> int:
     scope = _scope(args, repo_config)
     base_branch = worktree.default_branch(clone)
     launcher = _launcher(arm.adapter) if args.launch else None
-    oracle_inputs = _oracle_inputs(cfg, args.task)
-    task_base = _task_base(cfg, args.task)
+    oracle_inputs, task_base = _task_plan(cfg, args.task)
     pinned = _bridge_pin(cfg)
     mcp, server_config = _arm_mcp(cfg, repo_config, arm.adapter, pinned)
 
@@ -1249,15 +1235,15 @@ def _open_baseline(args) -> int:
     base_branch = worktree.default_branch(clone)
     # The human arm is judged with what its task tells the oracle, through the same server, for
     # the reason it is judged by the same oracle at all.
-    judged_with = _present(oracle_inputs=_oracle_inputs(cfg, task), bridge=_bridge_pin(cfg))
+    planned_inputs, task_base = _task_plan(cfg, task)
+    judged_with = _present(oracle_inputs=planned_inputs, bridge=_bridge_pin(cfg))
 
     run_id = ulid.new()
     run_dir = runstate.create(run_id)
     try:
         tree = os.path.join(run_dir, "wt")
         branch = f"baseline/{ulid.short(run_id)}"
-        base_sha = worktree.add(clone, tree, branch, base_branch,
-                                commit=_task_base(cfg, task))
+        base_sha = worktree.add(clone, tree, branch, base_branch, commit=task_base)
         worktree.bind_settings(clone, tree, runstate.baseline_settings(run_dir))
         runstate.write_hook(run_dir, run_id)
         runstate.write_timing_hook(run_dir)
