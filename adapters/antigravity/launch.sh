@@ -40,7 +40,7 @@
 #
 # THE CLIENT RUNS CONFINED. Its model reads through shell commands granted by name, and a command
 # granted by name reads any path the person can. `sandbox.py` runs it under bubblewrap over a
-# read-only root with the home, /tmp, the run directory and the user's runtime directory emptied,
+# read-only root with the home, /tmp, the directory of runs and the user's runtime directory emptied,
 # the worktree, the readable directories, the run's git configuration and hooks and the client's own
 # home mounted back, the App's key covered wherever it is configured, and only the kept variables of
 # the environment passed in: the run's token, its environment file and the person's credentials are

@@ -362,21 +362,24 @@ The client refuses the forms of `find` that write or run another program (`-dele
 `-execdir`, `-ok`, `-fprint`, `-fprintf`, `-fls`). The home's `allowNonWorkspaceAccess: false`
 bounds the client's own file tools, not the commands the list grants; those are confined by the
 launcher, which runs the client under bubblewrap (`adapters/antigravity/sandbox.py`). The root is
-mounted read-only; the home, `/tmp`, the run directory and the user's runtime directory are emptied;
+mounted read-only; the home, `/tmp`, the directory of runs (this run's and every other) and the
+user's runtime directory are emptied;
 then the worktree, the client's own home and the worktree's git directory are mounted back
 read-write, with the clone's configuration and hooks and the worktree's own configuration read-only
 over it, so that no `core.hooksPath` set from inside stops the hook that stamps `Exeris-Run:`. The
 run's git configuration and hooks, the readable directories, the pinned server, its documentation
 root and the directories of the client's and the server's programs are mounted read-only. The
 session bus socket, which the keyring sign-in uses, is bound read-write on its own. The App's private key and its age identity are
-covered by an empty file wherever they are configured. Of the environment only the locale, the
-session bus, the run's git identity and configuration and `EXERIS_RUN` are passed, to bubblewrap
-itself as well as to the client, so `GH_TOKEN` cannot be read from `/proc`.
+covered by an empty file wherever they are configured. The environment is narrowed to
+`KEPT_ENVIRONMENT` in `sandbox.py` — `PATH`, the locale, terminal and user, the session bus and
+runtime directory, the run's git identity, configuration and transport closures, and `EXERIS_RUN` —
+with `HOME` set to the client's own home, for bubblewrap itself as well as for the client, so
+`GH_TOKEN` cannot be read from `/proc`.
 
 What this hides is the person's and the run's secrets: the installation token and the run's
 environment file, the App's key, the person's `gh` and git credentials, other runs and other
 worktrees. It does not hide the operating system's own files — `/etc`, `/usr` and any path outside
-the home, `/tmp` and the run directory stay readable, which Claude's arm, confined to its workspace
+the home, `/tmp` and the directory of runs stay readable, which Claude's arm, confined to its workspace
 and readable directories, does not reach. A machine without `bwrap`, or without the configuration
 that names the key, does not run this arm.
 

@@ -74,8 +74,8 @@ MCP_TOOLS = claude_drive.MCP_TOOLS
 #: name would leave it unable to read what Claude's arm reads. The grant is by command name, and the
 #: client refuses the forms of `find` that write or run another program (`-delete`, `-exec`,
 #: `-execdir`, `-ok`, `-fprint`, `-fprintf`, `-fls`). Where these commands read is bounded by the
-#: launcher's sandbox, not by this list: the root is read-only and the home, `/tmp`, the run
-#: directory and the user's runtime directory are emptied before the worktree, the readable
+#: launcher's sandbox, not by this list: the root is read-only and the home, `/tmp`, the directory
+#: of runs and the user's runtime directory are emptied before the worktree, the readable
 #: directories, this client's home and what git and the programs need are mounted back, so the
 #: person's and the run's secrets are not there to be read; the operating system's own files stay
 #: readable. The git commands that only read the repository — `show`,

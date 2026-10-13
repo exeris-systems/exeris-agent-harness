@@ -66,7 +66,8 @@ class Layout:
 
     def __init__(self, tmp: pathlib.Path, outside: pathlib.Path | None = None):
         self.home = tmp / "home"
-        self.run = (outside or self.home / ".local" / "state" / "exeris-agent" / "runs") / "RUN"
+        state = outside / "state" if outside else self.home / ".local" / "state" / "exeris-agent"
+        self.run = state / "runs" / "RUN"
         self.worktree = self.run / "wt"
         self.worktree.mkdir(parents=True)
         self.key = (outside or self.home / ".config") / "exeris-agent" / "key.pem"
@@ -74,6 +75,11 @@ class Layout:
         self.key.write_text(_CANARY + "-key\n", encoding="utf-8")
         self.token = self.run / "token"
         self.token.write_text(_CANARY + "-token\n", encoding="utf-8")
+        # Another run beside this one, with its own token and environment file.
+        self.sibling = self.run.parent / "OTHER"
+        self.sibling.mkdir()
+        (self.sibling / "token").write_text(_CANARY + "-sibling-token\n", encoding="utf-8")
+        (self.sibling / "env").write_text(_CANARY + "-sibling-env\n", encoding="utf-8")
         (self.run / "env").write_text(_CANARY + "-env\n", encoding="utf-8")
         (self.run / "gitconfig").write_text("", encoding="utf-8")
         (self.run / "hooks").mkdir()
@@ -105,13 +111,14 @@ class ArgvTest(unittest.TestCase):
         tmpfs = {self.argv[i + 1]: i for i, a in enumerate(self.argv) if a == "--tmpfs"}
         self.assertIn(str(self.at.home), tmpfs)
         self.assertIn("/tmp", tmpfs)
-        self.assertIn(str(self.at.run), tmpfs)
+        self.assertIn(str(self.at.run.parent), tmpfs)
+        self.assertNotIn(str(self.at.run), tmpfs)
         self.assertLess(self.argv.index("--ro-bind"), min(tmpfs.values()))
         for flag, source, destination, index in _binds(self.argv, {"--bind", "--ro-bind",
                                                                     "--bind-try"}):
             if destination == "/":
                 continue
-            for top in (str(self.at.home), "/tmp", str(self.at.run)):
+            for top in (str(self.at.home), "/tmp", str(self.at.run.parent)):
                 if destination.startswith(top + os.sep):
                     self.assertGreater(index, tmpfs[top], f"{destination} is bound before {top}")
 
@@ -188,8 +195,9 @@ class ArgvTest(unittest.TestCase):
         separator = self.argv.index("--")
         self.assertEqual(["agy", "--add-dir", str(self.at.readable)], self.argv[separator + 1:])
 
-    def test_a_mount_that_holds_the_home_or_the_run_is_refused(self):
-        for wide in (self.at.home, self.at.run, self.at.home.parent):
+    def test_a_mount_that_holds_the_home_or_the_runs_or_lies_among_the_runs_is_refused(self):
+        for wide in (self.at.home, self.at.run, self.at.run.parent, self.at.sibling,
+                     self.at.home.parent):
             with self.assertRaises(ValueError, msg=str(wide)):
                 sandbox.argv(str(self.at.run), str(self.at.worktree), [str(wide)], ["agy"],
                              home=str(self.at.home), uid=4242)
@@ -239,6 +247,7 @@ class ConfinedTest(unittest.TestCase):
         (at.worktree / "readme.txt").write_text("placeholder: the tree\n", encoding="utf-8")
         done = self.run_confined(
             f"cat '{at.key}'; cat '{at.token}'; cat '{at.run / 'env'}'; "
+            f"cat '{at.sibling / 'token'}' '{at.sibling / 'env'}'; grep -r . '{at.run.parent}'; "
             f"tr '\\0' '\\n' < /proc/self/environ; env; "
             f"for p in /proc/[0-9]*/environ; do tr '\\0' '\\n' < $p; done; "
             f"cat readme.txt; echo written > out.txt; "
@@ -254,9 +263,9 @@ class ConfinedTest(unittest.TestCase):
     def test_the_worktree_is_read_and_written_and_no_secret_is_read(self):
         self.assert_nothing_secret_is_read(self.at)
 
-    def test_a_run_and_a_key_outside_the_home_and_tmp_are_not_read_either(self):
-        # A state root and a key configured beyond both the home and /tmp: here, beneath the
-        # checkout's own directory, which the sandbox's read-only root shows.
+    def test_runs_and_a_key_outside_the_home_and_tmp_are_not_read_either(self):
+        # A state root, with this run and another, and a key configured beyond both the home and
+        # /tmp: here, beneath the checkout's own directory, which the sandbox's read-only root shows.
         outside = pathlib.Path(tempfile.mkdtemp(prefix=".agy-sandbox-outside-", dir=_HERE))
         self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
         second = self.tmp / "second"

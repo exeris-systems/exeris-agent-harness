@@ -59,8 +59,9 @@ class LauncherTest(unittest.TestCase):
             found = shutil.which(tool)
             self.assertIsNotNone(found, f"{tool} is not on PATH")
             (self.tools / tool).symlink_to(found)
-        self.run_dir = self.tmp / "run"
-        self.run_dir.mkdir()
+        # Laid out as `open-run` lays one out: a run's directory sits in a directory of runs.
+        self.run_dir = self.tmp / "runs" / "run"
+        self.run_dir.mkdir(parents=True)
         self.worktree = self.tmp / "wt"
         self.worktree.mkdir()
         self.prompt = self.tmp / "task.txt"

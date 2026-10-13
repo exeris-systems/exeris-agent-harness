@@ -10,11 +10,12 @@ not there to be read.
 The plan, in the order bubblewrap applies it — a later mount lies over an earlier one, so the empty
 filesystems over `/tmp` and the home come before every bind beneath them:
 
-* the root, read-only; then an empty `/tmp`, an empty home and an empty run directory, which hide
-  the App's private key where it sits under the home, the person's `gh` and git configuration, the
-  run's installation token and environment file, every other run directory and every other
-  worktree. The run directory is emptied on its own because a state root can be moved outside the
-  home, where the read-only root would otherwise show it;
+* the root, read-only; then an empty `/tmp`, an empty home and an empty directory of runs — the
+  one this run's directory sits in — which hide the App's private key where it sits under the home,
+  the person's `gh` and git configuration, this run's installation token and environment file, and
+  every other run with its own token, environment file and worktree. The directory of runs is
+  emptied on its own because the state root can be moved outside the home, where the read-only root
+  would otherwise show it;
 * a fresh `/dev` and `/proc`;
 * read-write: the worktree, the run's own home for this client (it writes its state there), and the
   worktree's git common directory, where `git commit` writes objects and refs;
@@ -31,12 +32,12 @@ filesystems over `/tmp` and the home come before every bind beneath them:
 * the user's runtime directory emptied, and in it only the session bus socket bound, read-write:
   the client signs in through the keyring over that bus, and nothing else there — an SSH or GnuPG
   agent's socket among them — is the client's to reach;
-* and last, the empty home and the empty run directory made read-only, so that nothing written
+* and last, the empty home and the empty directory of runs made read-only, so that nothing written
   outside the mounts above is written anywhere at all. `/tmp` stays writable, and is the sandbox's
   own.
 
 The rest of the root stays readable: `/etc`, `/usr`, `/var` and any path outside the home, `/tmp` and
-the run directory. What the plan hides is the person's and the run's secrets, not the operating
+the directory of runs. What the plan hides is the person's and the runs' secrets, not the operating
 system's files.
 
 Only `KEPT_ENVIRONMENT` crosses into the sandbox, with `HOME` at the client's own home. The
@@ -45,7 +46,7 @@ readable from `/proc` by any command the client may run — bubblewrap's own inc
 first process of the sandbox's process namespace. So bubblewrap is itself started with only the kept
 variables, and clears its environment again before the client starts.
 
-A mounted directory that holds the run directory or the home is refused rather than mounted, since
+A mounted directory that holds the directory of runs or the home is refused rather than mounted, since
 it would put back everything the empty filesystems hide.
 
 Nothing else of the run directory is mounted: not its installation token, its environment file, its
@@ -110,26 +111,28 @@ def argv(run_dir: str, worktree: str, readable, agy_command, *,
     home = os.environ["HOME"] if home is None else home
     uid = os.getuid() if uid is None else uid
     agy_home = drive.home(run_dir)
+    runs = os.path.dirname(run_dir)
     runtime = f"/run/user/{uid}"
     out = [BWRAP, "--die-with-parent", "--unshare-pid",
            "--ro-bind", "/", "/",
            "--tmpfs", SHARED_TEMPORARY,
            "--tmpfs", home,
-           "--tmpfs", run_dir,
+           "--tmpfs", runs,
            "--dev", "/dev",
            "--proc", "/proc"]
     for path in (worktree, agy_home, git_common_dir):
         if path:
             out += ["--bind", path, path]
     out += _git_settings(git_common_dir, git_dir)
-    out += _read_only([os.path.join(run_dir, GITCONFIG), os.path.join(run_dir, HOOKS), *readable,
-                       bridge_dir, docs_root, *program_dirs], run_dir, home)
-    out += _covered(secrets, run_dir, home)
+    for path in (os.path.join(run_dir, GITCONFIG), os.path.join(run_dir, HOOKS)):
+        out += ["--ro-bind", path, path]
+    out += _read_only([*readable, bridge_dir, docs_root, *program_dirs], runs, home)
+    out += _covered(secrets, runs, home)
     bus = os.path.join(runtime, "bus")
     out += ["--tmpfs", runtime,
             "--bind-try", bus, bus,
             "--remount-ro", home,
-            "--remount-ro", run_dir,
+            "--remount-ro", runs,
             "--clearenv"]
     for key, value in kept(os.environ if environment is None else environment).items():
         out += ["--setenv", key, value]
@@ -153,22 +156,25 @@ def _git_settings(git_common_dir: str | None, git_dir: str | None) -> list[str]:
     return out
 
 
-def _read_only(paths, run_dir: str, home: str) -> list[str]:
-    """Each path bound read-only; one that holds the run directory or the home is refused."""
+def _read_only(paths, runs: str, home: str) -> list[str]:
+    """Each path bound read-only. One that holds the directory of runs or the home, or lies inside
+    the directory of runs — a run's directory, with its token, among them — is refused."""
     out = []
     for path in _unique(paths):
-        for covered in (run_dir, home):
+        for covered in (runs, home):
             if _within(covered, path):
                 raise ValueError(f"{path} holds {covered}, which the sandbox exists to hide")
+        if _within(path, runs):
+            raise ValueError(f"{path} is inside {runs}, which the sandbox exists to hide")
         out += ["--ro-bind", path, path]
     return out
 
 
-def _covered(secrets, run_dir: str, home: str) -> list[str]:
+def _covered(secrets, runs: str, home: str) -> list[str]:
     """An empty file over each secret the empty filesystems leave visible."""
     out = []
     for path in _unique(secrets):
-        if os.path.isfile(path) and not _hidden(path, home, run_dir):
+        if os.path.isfile(path) and not _hidden(path, home, runs):
             out += ["--ro-bind", os.devnull, path]
     return out
 
@@ -238,9 +244,9 @@ def _within(path: str, top: str) -> bool:
     return os.path.commonpath([os.path.abspath(path), os.path.abspath(top)]) == os.path.abspath(top)
 
 
-def _hidden(path: str, home: str, run_dir: str | None = None) -> bool:
-    """Whether the empty home, `/tmp` or run directory covers `path` inside the sandbox."""
-    return any(_within(path, top) for top in (home, SHARED_TEMPORARY, run_dir) if top)
+def _hidden(path: str, home: str, runs: str | None = None) -> bool:
+    """Whether the empty home, `/tmp` or directory of runs covers `path` inside the sandbox."""
+    return any(_within(path, top) for top in (home, SHARED_TEMPORARY, runs) if top)
 
 
 def program_dirs(programs, home: str) -> list[str]:
