@@ -326,6 +326,21 @@ def _oracle_inputs(cfg, task: str) -> dict | None:
                       f"what its task says or is not opened") from None
 
 
+def _task_base(cfg, task: str) -> str | None:
+    """The commit a registered task starts every arm from, or nothing.
+
+    Read from the same record as the oracle inputs and refused the same way: a run of a task that
+    names a base it cannot read would start from somewhere the task did not plan.
+    """
+    if not cfg.registry_path or not task.startswith(registry.PREFIX):
+        return None
+    try:
+        return registry.task_base(cfg.registry_path, task)
+    except registry.RegistryError as exc:
+        raise Refused(f"{exc}; [registry] path is configured, and a registered run starts where "
+                      f"its task says or is not opened") from None
+
+
 def _bridge_pin(cfg) -> dict | None:
     """The configured Exeris MCP server, pinned, or nothing where none is configured."""
     if not cfg.bridge_path:
@@ -406,6 +421,7 @@ def cmd_open_run(args) -> int:
     base_branch = worktree.default_branch(clone)
     launcher = _launcher(arm.adapter) if args.launch else None
     oracle_inputs = _oracle_inputs(cfg, args.task)
+    task_base = _task_base(cfg, args.task)
     pinned = _bridge_pin(cfg)
     mcp, server_config = _arm_mcp(cfg, repo_config, arm.adapter, pinned)
 
@@ -441,7 +457,7 @@ def cmd_open_run(args) -> int:
 
         tree = os.path.join(run_dir, "wt")
         branch = f"agent/{ulid.short(run_id)}"
-        base_sha = worktree.add(clone, tree, branch, base_branch)
+        base_sha = worktree.add(clone, tree, branch, base_branch, commit=task_base)
         worktree.bind_identity(clone, tree, user_name=cfg.bot_login,
                                user_email=cfg.noreply_email,
                                settings=runstate.worktree_settings(run_dir, cfg.org))
@@ -1240,7 +1256,8 @@ def _open_baseline(args) -> int:
     try:
         tree = os.path.join(run_dir, "wt")
         branch = f"baseline/{ulid.short(run_id)}"
-        base_sha = worktree.add(clone, tree, branch, base_branch)
+        base_sha = worktree.add(clone, tree, branch, base_branch,
+                                commit=_task_base(cfg, task))
         worktree.bind_settings(clone, tree, runstate.baseline_settings(run_dir))
         runstate.write_hook(run_dir, run_id)
         runstate.write_timing_hook(run_dir)
