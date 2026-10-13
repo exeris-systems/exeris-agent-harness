@@ -345,7 +345,9 @@ tools}` (with Antigravity's `observed` listing line beside them) for an arm give
 **What a pass is allowed.** Both arms are given one fixed surface. Claude Code's `drive` passes
 get `--allowedTools` with `Read,Edit,Write,Glob,Grep` and `Bash(<command>:*)` for `git add`,
 `git commit`, `git status`, `git diff`, `git log` and `ls`, plus the three server tools for an arm
-given the server. Antigravity's home allows `command(<command>)` for the same six commands, plus
+given the server. Antigravity's home allows `command(<command>)` for the same six commands and
+for `pwd`, `cat`, `head`, `tail`, `find`, `grep` and `wc` — the read-only commands that stand in
+for Read, Glob and Grep, which that client's model reaches through its shell — plus
 `mcp(exeris/docs-list_adrs)`, `mcp(exeris/docs-get_adr)` and `mcp(exeris/docs-search)` for an arm
 given the server, and the manifest records that list as `permissions`, which `drive` checks the
 home still grants before its first pass. Reading and editing need no grant in its accept-edits

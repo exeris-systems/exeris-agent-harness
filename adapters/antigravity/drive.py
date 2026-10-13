@@ -66,9 +66,14 @@ MCP_ROUTE = "home"
 #: Claude Code's arm is allowed, so that the two arms of a group read through the same tools.
 MCP_TOOLS = claude_drive.MCP_TOOLS
 
-#: The commands a pass may run without asking: the ones Claude Code's arm is allowed. Git may read
-#: and commit; it may not push, which is the close's.
-COMMANDS = ("git add", "git commit", "git status", "git diff", "git log", "ls")
+#: The commands a pass may run without asking. Two halves, one capability: the git and listing
+#: commands Claude Code's arm is allowed by name, and the read-only commands that stand in for the
+#: built-in Read, Glob and Grep it is allowed as tools — this client's model reads and searches the
+#: tree through its shell, and in print mode a refused command ends the pass, so a list equal by
+#: name would leave it unable to read what Claude's arm reads. Nothing here writes outside the
+#: tree's edits and commits; git may not push, which is the close's.
+COMMANDS = ("git add", "git commit", "git status", "git diff", "git log", "ls",
+            "pwd", "cat", "head", "tail", "find", "grep", "wc")
 
 #: The run's own home for this client, inside the run's directory, and the three files under it.
 HOME = "agy-home"
