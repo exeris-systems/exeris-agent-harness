@@ -46,7 +46,8 @@ EXPECTED_TOOLS = ["mcp__exeris__docs-list_adrs", "mcp__exeris__docs-get_adr",
 AGY_COMMANDS = ["command(git add)", "command(git commit)", "command(git status)",
                 "command(git diff)", "command(git log)", "command(ls)", "command(pwd)",
                 "command(cat)", "command(head)", "command(tail)", "command(find)", "command(grep)",
-                "command(wc)"]
+                "command(wc)", "command(git show)", "command(git rev-parse)",
+                "command(git ls-files)", "command(which)"]
 AGY_MCP = ["mcp(exeris/docs-list_adrs)", "mcp(exeris/docs-get_adr)", "mcp(exeris/docs-search)"]
 
 MCP_FENCE = support.FENCE.replace("harness-claude-", "harness-claude-mcp-")
@@ -228,10 +229,14 @@ class AntigravityMcpTest(McpFixture):
         self.assertEqual([f"command({command})" for command in commands],
                          granted[:len(commands)])
         # The rest stand in for the reading tools the other arm is given as tools: commands that
-        # read, the forms of `find` that write being refused by the client rather than by this list.
+        # read. Neither `git config` nor `git branch` is among them: the first can unset the hook
+        # that stamps the run's commits, the second can delete branches in the shared clone.
         self.assertTrue({"Read", "Glob", "Grep"} <= set(tools), tools)
+        self.assertFalse({"command(git config)", "command(git branch)"} & set(granted), granted)
         self.assertEqual(["command(pwd)", "command(cat)", "command(head)", "command(tail)",
-                          "command(find)", "command(grep)", "command(wc)"],
+                          "command(find)", "command(grep)", "command(wc)",
+                          "command(git show)", "command(git rev-parse)", "command(git ls-files)",
+                          "command(which)"],
                          granted[len(commands):])
 
     def test_the_person_s_own_configuration_decides_nothing(self):

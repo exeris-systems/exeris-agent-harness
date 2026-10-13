@@ -348,19 +348,25 @@ reading capability. Claude Code's `drive` passes get `--allowedTools` with
 `git diff`, `git log` and `ls`, plus the three server tools for an arm given the server.
 
 Antigravity's home allows `command(<command>)` for the same six commands and for `pwd`, `cat`,
-`head`, `tail`, `find`, `grep` and `wc`, plus `mcp(exeris/docs-list_adrs)`,
-`mcp(exeris/docs-get_adr)` and `mcp(exeris/docs-search)` for an arm given the server. The seven
-stand in for Read, Glob and Grep, which that client's model reaches through its shell. The manifest
+`head`, `tail`, `find`, `grep` and `wc`, for the read-only git commands `git show`,
+`git rev-parse` and `git ls-files`, and for `which`, plus `mcp(exeris/docs-list_adrs)`,
+`mcp(exeris/docs-get_adr)` and `mcp(exeris/docs-search)` for an arm given the server. These stand
+in for Read, Glob and Grep, which that client's model reaches through its shell, and in print mode
+each command it is refused ends its pass. `git config` and `git branch` are not granted: the first
+can unset the hook that stamps `Exeris-Run:`, the second can delete branches in the clone whose git
+directory the sandbox mounts writable. The manifest
 records the list as `permissions`, and `drive` checks the home still grants it before its first
 pass. Reading and editing need no grant in the client's accept-edits mode, the home trusts the
 run's worktree, and the readable directories reach it as `--add-dir`.
 
-Two things about that list are measured rather than assumed. The client refuses every form of
-`find` that writes or runs something else — `-delete`, `-exec`, `-execdir`, `-ok`, `-fprint`,
-`-fprintf` and `-fls` were each refused under it. And the home's `allowNonWorkspaceAccess: false`
-bounds the client's own file tools, not the commands the list grants: `cat`, `grep` and `find` read
-paths outside the tree, which Claude's arm cannot. That outside read is the accepted cost of a list
-this client's model can read the tree with.
+The client refuses the forms of `find` that write or run another program (`-delete`, `-exec`,
+`-execdir`, `-ok`, `-fprint`, `-fprintf`, `-fls`). The home's `allowNonWorkspaceAccess: false`
+bounds the client's own file tools, not the commands the list grants; those are confined by the
+launcher, which runs the client under bubblewrap (`adapters/antigravity/sandbox.py`) with an empty
+home and an empty `/tmp`, and mounts only the worktree, the readable directories, the client's own
+home, the worktree's git directory, the run's git configuration and hooks, and the pinned server.
+The run's token, its environment and the rest of the person's home are not there to be read, so
+the reading commands read what Claude's arm reads. A machine without `bwrap` does not run this arm.
 
 In print mode a command outside the list is refused and ends the invocation; the stream's closing
 event lists it under `denied_actions`, which the row counts.
