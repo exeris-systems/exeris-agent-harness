@@ -2,11 +2,13 @@
 
 Two levels. The command line is checked on every machine: the empty filesystems come before every
 bind beneath them, the paths the client writes are bound read-write, the paths it only reads are
-bound read-only, and no part of the run directory that holds a secret is ever a bind source. Where
-`bwrap` can build a namespace, the plan is also run: a program inside it reads the worktree and
-writes to it, and reads neither of two canaries placed where the App's key and the installation
-token live, and a commit made inside it is stamped by the run's hook. Every path is under a
-temporary directory standing in for the home, so no real secret is involved.
+bound read-only, no part of the run directory that holds a secret is ever a bind source, a key the
+empty filesystems leave visible is covered, and of the environment only the kept variables cross.
+Where `bwrap` can build a namespace, the plan is also run: a program inside it reads the worktree
+and writes to it, and reads none of the canaries placed where the App's key, the installation token
+and the run's environment file live, nor the token as `GH_TOKEN` through `/proc`, with the run
+directory and the key under the home and outside it; and a commit made inside it is stamped by the
+run's hook. Every path is under a temporary directory, so no real secret is involved.
 """
 
 import json
@@ -56,14 +58,18 @@ def _bwrap_works() -> str | None:
 
 
 class Layout:
-    """A home, a run directory under it laid out as `open-run` lays one out, and a worktree."""
+    """A home, a run directory laid out as `open-run` lays one out, and a worktree.
 
-    def __init__(self, tmp: pathlib.Path):
+    The run directory and the key are under the home unless `outside` names a directory beyond both
+    the home and `/tmp`, standing in for a state root and a key configured elsewhere.
+    """
+
+    def __init__(self, tmp: pathlib.Path, outside: pathlib.Path | None = None):
         self.home = tmp / "home"
-        self.run = self.home / ".local" / "state" / "exeris-agent" / "runs" / "RUN"
+        self.run = (outside or self.home / ".local" / "state" / "exeris-agent" / "runs") / "RUN"
         self.worktree = self.run / "wt"
         self.worktree.mkdir(parents=True)
-        self.key = self.home / ".config" / "exeris-agent" / "key.pem"
+        self.key = (outside or self.home / ".config") / "exeris-agent" / "key.pem"
         self.key.parent.mkdir(parents=True)
         self.key.write_text(_CANARY + "-key\n", encoding="utf-8")
         self.token = self.run / "token"
@@ -89,18 +95,23 @@ class ArgvTest(unittest.TestCase):
                                  home=str(self.at.home), uid=4242,
                                  bridge_dir=str(self.at.bridge),
                                  git_common_dir=str(self.at.common),
-                                 program_dirs=[str(self.at.home / ".local" / "bin")])
+                                 program_dirs=[str(self.at.home / ".local" / "bin")],
+                                 environment={"PATH": "/usr/bin", "GH_TOKEN": _CANARY,
+                                              "GH_CONFIG_DIR": str(self.at.run / "gh"),
+                                              "GITHUB_TOKEN": _CANARY, "EXERIS_RUN": "RUN",
+                                              "HOME": str(self.at.home)})
 
-    def test_home_and_tmp_are_emptied_before_any_bind_beneath_them(self):
+    def test_home_tmp_and_the_run_are_emptied_before_any_bind_beneath_them(self):
         tmpfs = {self.argv[i + 1]: i for i, a in enumerate(self.argv) if a == "--tmpfs"}
         self.assertIn(str(self.at.home), tmpfs)
         self.assertIn("/tmp", tmpfs)
+        self.assertIn(str(self.at.run), tmpfs)
         self.assertLess(self.argv.index("--ro-bind"), min(tmpfs.values()))
         for flag, source, destination, index in _binds(self.argv, {"--bind", "--ro-bind",
                                                                     "--bind-try"}):
             if destination == "/":
                 continue
-            for top in (str(self.at.home), "/tmp"):
+            for top in (str(self.at.home), "/tmp", str(self.at.run)):
                 if destination.startswith(top + os.sep):
                     self.assertGreater(index, tmpfs[top], f"{destination} is bound before {top}")
 
@@ -132,6 +143,30 @@ class ArgvTest(unittest.TestCase):
         for hidden in (self.at.token, self.at.run / "env", self.at.run / "gh",
                        self.at.run / "staging", self.at.run, self.at.home, self.at.key):
             self.assertNotIn(str(hidden), sources)
+
+    def test_of_the_environment_only_the_kept_variables_cross(self):
+        clear = self.argv.index("--clearenv")
+        passed = {self.argv[i + 1]: self.argv[i + 2] for i, a in enumerate(self.argv)
+                  if a == "--setenv"}
+        self.assertTrue(all(i > clear for i, a in enumerate(self.argv) if a == "--setenv"))
+        self.assertEqual({"PATH": "/usr/bin", "EXERIS_RUN": "RUN",
+                          "HOME": str(self.at.run / agy_drive.HOME)}, passed)
+        self.assertNotIn(_CANARY, self.argv)
+        self.assertTrue(set(sandbox.KEPT_ENVIRONMENT).isdisjoint(
+            {"GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR", "HOME"}))
+
+    def test_a_key_the_empty_filesystems_leave_visible_is_covered(self):
+        # Beneath the checkout's own directory: beyond the home, /tmp and the run.
+        outside = pathlib.Path(tempfile.mkdtemp(prefix=".agy-sandbox-key-", dir=_HERE))
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        key = outside / "key.pem"
+        key.write_text("placeholder\n", encoding="utf-8")
+        argv = sandbox.argv(str(self.at.run), str(self.at.worktree), [], ["agy"],
+                            home=str(self.at.home), uid=4242,
+                            secrets=[str(key), str(self.at.key), str(outside / "absent.pem")],
+                            environment={})
+        covered = [list(b[1:3]) for b in _binds(argv, {"--ro-bind"}) if b[1] == os.devnull]
+        self.assertEqual([[os.devnull, str(key)]], covered)
 
     def test_the_client_runs_in_the_worktree_under_its_own_home(self):
         self.assertIn(["--setenv", "HOME", str(self.at.run / agy_drive.HOME)],
@@ -173,23 +208,49 @@ class ConfinedTest(unittest.TestCase):
         self.tmp = tmp
         self.at = Layout(tmp)
 
-    def run_confined(self, script, **kwargs):
-        argv = sandbox.argv(str(self.at.run), str(self.at.worktree), [], ["sh", "-c", script],
-                            home=str(self.at.home), **kwargs)
-        return subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    def run_confined(self, script, at=None):
+        """`script` run as the launcher runs the client: through `sandbox.py`, from the worktree,
+        with the token in the environment it is started with, as a run's is."""
+        at = at or self.at
+        configuration = at.run.parent / "config.toml"
+        configuration.write_text('[github]\nclient_id = "placeholder"\ninstallation_id = 1\n'
+                                 f'bot_user_id = 1\nprivate_key = "{at.key}"\n',
+                                 encoding="utf-8")
+        environment = {"PATH": os.environ["PATH"], "HOME": str(at.home),
+                       "EXERIS_AGENT_CONFIG": str(configuration),
+                       "GH_TOKEN": _CANARY + "-environment",
+                       "GITHUB_TOKEN": _CANARY + "-environment"}
+        return subprocess.run([sys.executable, str(pathlib.Path(sandbox.__file__)), str(at.run),
+                               "--", "sh", "-c", script], cwd=at.worktree, env=environment,
+                              capture_output=True, text=True, timeout=60)
 
-    def test_the_worktree_is_read_and_written_and_no_secret_is_read(self):
-        (self.at.worktree / "readme.txt").write_text("placeholder: the tree\n", encoding="utf-8")
+    def assert_nothing_secret_is_read(self, at):
+        (at.worktree / "readme.txt").write_text("placeholder: the tree\n", encoding="utf-8")
         done = self.run_confined(
-            f"cat '{self.at.key}'; cat '{self.at.token}'; cat '{self.at.run / 'env'}'; "
+            f"cat '{at.key}'; cat '{at.token}'; cat '{at.run / 'env'}'; "
+            f"tr '\\0' '\\n' < /proc/self/environ; env; "
+            f"for p in /proc/[0-9]*/environ; do tr '\\0' '\\n' < $p; done; "
             f"cat readme.txt; echo written > out.txt; "
-            f"echo x > '{self.at.run / 'planted'}' && echo planted")
+            f"echo x > '{at.run / 'planted'}' && echo planted", at=at)
         self.assertIn("placeholder: the tree", done.stdout)
+        self.assertIn("PATH=", done.stdout)
         self.assertNotIn(_CANARY, done.stdout + done.stderr)
         self.assertNotIn("planted", done.stdout)
-        self.assertEqual("written\n", (self.at.worktree / "out.txt").read_text(encoding="utf-8"))
-        self.assertFalse((self.at.run / "planted").exists())
-        self.assertEqual(_CANARY + "-token\n", self.at.token.read_text(encoding="utf-8"))
+        self.assertEqual("written\n", (at.worktree / "out.txt").read_text(encoding="utf-8"))
+        self.assertFalse((at.run / "planted").exists())
+        self.assertEqual(_CANARY + "-token\n", at.token.read_text(encoding="utf-8"))
+
+    def test_the_worktree_is_read_and_written_and_no_secret_is_read(self):
+        self.assert_nothing_secret_is_read(self.at)
+
+    def test_a_run_and_a_key_outside_the_home_and_tmp_are_not_read_either(self):
+        # A state root and a key configured beyond both the home and /tmp: here, beneath the
+        # checkout's own directory, which the sandbox's read-only root shows.
+        outside = pathlib.Path(tempfile.mkdtemp(prefix=".agy-sandbox-outside-", dir=_HERE))
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        second = self.tmp / "second"
+        second.mkdir()
+        self.assert_nothing_secret_is_read(Layout(second, outside=outside))
 
     def test_a_commit_inside_is_written_to_the_repository_and_stamped_by_the_hook(self):
         origin = self.tmp / "origin"
@@ -217,7 +278,7 @@ class ConfinedTest(unittest.TestCase):
         argv = sandbox.argv(str(self.at.run), str(self.at.worktree), [],
                             ["sh", "-c", "echo change > f.txt && git add f.txt && "
                                          "git commit -q -m 'placeholder: change'"],
-                            home=str(self.at.home), git_common_dir=common)
+                            home=str(self.at.home), git_common_dir=common, environment=env)
         done = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(0, done.returncode, done.stderr)
         self.assertIn("Exeris-Run: RUN", git("log", "-1", "--format=%B", "run", cwd=origin))

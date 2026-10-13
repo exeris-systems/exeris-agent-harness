@@ -39,11 +39,13 @@
 # client signs in through the operating system's keyring, which no home holds.
 #
 # THE CLIENT RUNS CONFINED. Its model reads through shell commands granted by name, and a command
-# granted by name reads any path the person can. `sandbox.py` runs it under bubblewrap with only the
-# worktree, the readable directories, the run's git configuration and hooks and the client's own
-# home mounted; the run's token, its environment and everything else of the person's home are not
-# there to be read. The redirection and the version probe stay outside, where the run's directory
-# is. Without bubblewrap the client is not started.
+# granted by name reads any path the person can. `sandbox.py` runs it under bubblewrap over a
+# read-only root with the home, /tmp, the run directory and the user's runtime directory emptied,
+# the worktree, the readable directories, the run's git configuration and hooks and the client's own
+# home mounted back, the App's key covered wherever it is configured, and only the kept variables of
+# the environment passed in: the run's token, its environment file and the person's credentials are
+# not there to be read. The redirection and the version probe stay outside, where the run's directory
+# is. Without bubblewrap, or without the configuration that names the key, the client is not started.
 set -eu
 
 run_dir="$(dirname "${GIT_CONFIG_GLOBAL:?the run environment has not been sourced}")"

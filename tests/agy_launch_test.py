@@ -67,6 +67,9 @@ class LauncherTest(unittest.TestCase):
         self.prompt.write_text("placeholder: the task\n", encoding="utf-8")
         self.person = self.tmp / "person"
         self.person.mkdir()
+        self.config = self.tmp / "config.toml"
+        self.config.write_text('[github]\nclient_id = "placeholder"\ninstallation_id = 1\n'
+                               'bot_user_id = 1\nprivate_key = "key.pem"\n', encoding="utf-8")
 
     def with_bwrap(self):
         shutil.copyfile(FAKE_BWRAP, self.bin / "bwrap")
@@ -79,6 +82,7 @@ class LauncherTest(unittest.TestCase):
             "GIT_CONFIG_GLOBAL": str(self.run_dir / "gitconfig"),
             "EXERIS_PROMPT_FILE": str(self.prompt),
             "EXERIS_MODEL_ID": support.AGY_MODEL,
+            "EXERIS_AGENT_CONFIG": str(self.config),
         }
         return subprocess.run(["/bin/sh", str(LAUNCHER), *extra], env=environment,
                               cwd=self.worktree, capture_output=True, text=True, timeout=60)
@@ -137,6 +141,16 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual([], self.agy_calls())
         self.assertEqual([], self.bwrap_calls())
         self.assertFalse((self.run_dir / "agy.jsonl").exists())
+
+    def test_without_a_configuration_the_key_cannot_be_hidden_and_the_client_is_not_started(self):
+        self.with_bwrap()
+        agy_drive.write_home(str(self.run_dir), worktree=str(self.worktree), server_config=None)
+        self.config.unlink()
+        done = self.launch()
+        self.assertEqual(2, done.returncode, done.stderr)
+        self.assertIn("key", done.stderr)
+        self.assertEqual([], self.agy_calls())
+        self.assertEqual([], self.bwrap_calls())
 
 
 if __name__ == "__main__":

@@ -18,12 +18,10 @@ under that home would be allowed what the person happened to allow, and two arms
 differ in a power neither of them records. So `open-run` writes `<run>/agy-home`, holding only the
 three files the client reads them from, and the launcher runs the client with `HOME` pointing there:
 
-* `antigravity-cli/settings.json` allows exactly `permissions(mcp=…)` — the git and `ls` commands
-  Claude Code's arm is allowed, the reading commands `pwd`, `cat`, `head`, `tail`, `find`, `grep`
-  and `wc`, and the Exeris server's documentation tools where the arm is given the server — keeps
-  the client's own file tools inside its workspace, and trusts the run's worktree. The reading
-  commands are held by the launcher's sandbox, which mounts only the worktree, the readable
-  directories and this home (see `sandbox.py`);
+* `antigravity-cli/settings.json` allows exactly `permissions(mcp=…)` — `COMMANDS`, and the Exeris
+  server's documentation tools where the arm is given the server — keeps the client's own file tools
+  inside its workspace, and trusts the run's worktree. Where the granted commands read is bounded
+  by the launcher's sandbox (`sandbox.py`), not by this file;
 * `config/config.json` grants nothing globally, and says its grants are already in the shape the
   client would otherwise migrate them to, so nothing is carried in from elsewhere;
 * `config/mcp_config.json` lists the pinned server for an arm given it and no server for one not.
@@ -76,9 +74,11 @@ MCP_TOOLS = claude_drive.MCP_TOOLS
 #: name would leave it unable to read what Claude's arm reads. The grant is by command name, and the
 #: client refuses the forms of `find` that write or run another program (`-delete`, `-exec`,
 #: `-execdir`, `-ok`, `-fprint`, `-fprintf`, `-fls`). Where these commands read is bounded by the
-#: launcher's sandbox, not by this list: the client runs with only the worktree, the readable
-#: directories and its own home mounted, so they read what Claude's arm, confined to its workspace
-#: and readable directories, reads. The git commands that only read the repository — `show`,
+#: launcher's sandbox, not by this list: the root is read-only and the home, `/tmp`, the run
+#: directory and the user's runtime directory are emptied before the worktree, the readable
+#: directories, this client's home and what git and the programs need are mounted back, so the
+#: person's and the run's secrets are not there to be read; the operating system's own files stay
+#: readable. The git commands that only read the repository — `show`,
 #: `rev-parse`, `ls-files` — and `which` are granted for the same reason: the model inspects before it
 #: edits, and each refusal costs it the pass. Not granted: `git config`, which could unset the hook
 #: that stamps `Exeris-Run:`, and `git branch`, which could delete branches in the clone whose git

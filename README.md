@@ -362,11 +362,22 @@ run's worktree, and the readable directories reach it as `--add-dir`.
 The client refuses the forms of `find` that write or run another program (`-delete`, `-exec`,
 `-execdir`, `-ok`, `-fprint`, `-fprintf`, `-fls`). The home's `allowNonWorkspaceAccess: false`
 bounds the client's own file tools, not the commands the list grants; those are confined by the
-launcher, which runs the client under bubblewrap (`adapters/antigravity/sandbox.py`) with an empty
-home and an empty `/tmp`, and mounts only the worktree, the readable directories, the client's own
-home, the worktree's git directory, the run's git configuration and hooks, and the pinned server.
-The run's token, its environment and the rest of the person's home are not there to be read, so
-the reading commands read what Claude's arm reads. A machine without `bwrap` does not run this arm.
+launcher, which runs the client under bubblewrap (`adapters/antigravity/sandbox.py`). The root is
+mounted read-only; the home, `/tmp`, the run directory and the user's runtime directory are emptied;
+then the worktree, the client's own home and the worktree's git directory are mounted back
+read-write, and the run's git configuration and hooks, the readable directories, the pinned server,
+its documentation root and the directories of the client's and the server's programs read-only,
+with the session bus the keyring sign-in uses. The App's private key and its age identity are
+covered by an empty file wherever they are configured. Of the environment only the locale, the
+session bus, the run's git identity and configuration and `EXERIS_RUN` are passed, to bubblewrap
+itself as well as to the client, so `GH_TOKEN` cannot be read from `/proc`.
+
+What this hides is the person's and the run's secrets: the installation token and the run's
+environment file, the App's key, the person's `gh` and git credentials, other runs and other
+worktrees. It does not hide the operating system's own files — `/etc`, `/usr` and any path outside
+the home, `/tmp` and the run directory stay readable, which Claude's arm, confined to its workspace
+and readable directories, does not reach. A machine without `bwrap`, or without the configuration
+that names the key, does not run this arm.
 
 In print mode a command outside the list is refused and ends the invocation; the stream's closing
 event lists it under `denied_actions`, which the row counts.

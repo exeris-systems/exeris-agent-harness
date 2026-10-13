@@ -219,7 +219,7 @@ class AntigravityMcpTest(McpFixture):
         self.assertIsNone(manifest["mcp"])
         self.assertEqual(AGY_COMMANDS, manifest["permissions"])
 
-    def test_the_allow_list_is_the_one_the_other_arm_is_given(self):
+    def test_the_allow_list_is_the_other_arm_s_commands_and_the_reading_stand_ins(self):
         self.assertEqual(AGY_COMMANDS + AGY_MCP, agy_drive.permissions(mcp=True))
         self.assertEqual(list(claude_drive.MCP_TOOLS), list(agy_drive.MCP_TOOLS))
         tools = claude_drive.ALLOWED_TOOLS.split(",")

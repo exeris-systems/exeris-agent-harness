@@ -10,8 +10,14 @@ not there to be read.
 The plan, in the order bubblewrap applies it — a later mount lies over an earlier one, so the empty
 filesystems over `/tmp` and the home come before every bind beneath them:
 
-* the root, read-only; then an empty `/tmp` and an empty home, which hide the App's private key,
-  the person's `gh` and git configuration, every run directory and every other worktree;
+* the root, read-only; then an empty `/tmp`, an empty home and an empty run directory, which hide
+  the App's private key where it sits under the home, the person's `gh` and git configuration, the
+  run's installation token and environment file, every other run directory and every other
+  worktree. The run directory is emptied on its own because a state root can be moved outside the
+  home, where the read-only root would otherwise show it;
+* the App's private key and the identity it is decrypted with, each covered by an empty file where
+  the empty filesystems do not already hide it — a key configured under `/etc` or `/opt` is on the
+  read-only root;
 * a fresh `/dev` and `/proc`;
 * read-write: the worktree, the run's own home for this client (it writes its state there), and the
   worktree's git common directory, where `git commit` writes objects and refs;
@@ -22,15 +28,26 @@ filesystems over `/tmp` and the home come before every bind beneath them:
 * the user's runtime directory emptied, and in it only the session bus socket bound, read-write:
   the client signs in through the keyring over that bus, and nothing else there — an SSH or GnuPG
   agent's socket among them — is the client's to reach;
-* and last, the empty home made read-only, so that nothing written outside the mounts above is
-  written anywhere at all. `/tmp` stays writable, and is the sandbox's own.
+* and last, the empty home and the empty run directory made read-only, so that nothing written
+  outside the mounts above is written anywhere at all. `/tmp` stays writable, and is the sandbox's
+  own.
+
+The rest of the root stays readable: `/etc`, `/usr`, `/var` and any path outside the home, `/tmp` and
+the run directory. What the plan hides is the person's and the run's secrets, not the operating
+system's files.
+
+Only `KEPT_ENVIRONMENT` crosses into the sandbox, with `HOME` at the client's own home. The
+installation token reaches the run's own calls as `GH_TOKEN`, and a process's environment is
+readable from `/proc` by any command the client may run — bubblewrap's own included, which is the
+first process of the sandbox's process namespace. So bubblewrap is itself started with only the kept
+variables, and clears its environment again before the client starts.
 
 A mounted directory that holds the run directory or the home is refused rather than mounted, since
 it would put back everything the empty filesystems hide.
 
 Nothing else of the run directory is mounted: not its installation token, its environment file, its
-`gh` configuration, its staging area or its streams. The client runs with `HOME` at its own home and
-in the worktree, dies with the launcher, and sees only its own processes.
+`gh` configuration, its staging area or its streams. The client runs in the worktree, dies with the
+launcher, and sees only its own processes.
 """
 
 import json
@@ -44,7 +61,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from adapters.antigravity import drive  # noqa: E402
-from harness import bridge  # noqa: E402
+from harness import bridge, config  # noqa: E402
 
 #: The program the plan is handed to.
 BWRAP = "bwrap"
@@ -59,23 +76,37 @@ ADD_DIR = "--add-dir"
 #: Where a pinned server's entry point lives inside its package: `<package>/dist/server.js`.
 _ENTRY_DEPTH = 2
 
+#: The variables the client is started with, where they are set; every other one is cleared. The
+#: locale and terminal; the session bus the keyring sign-in goes through; the run's git identity,
+#: configuration and the closures under its credential helper; the run's id. Not the installation
+#: token, the `gh` configuration, or anything the person's shell carried besides these.
+KEPT_ENVIRONMENT = ("PATH", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TERM", "TZ",
+                    "USER", "LOGNAME", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR",
+                    "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_SSH_COMMAND",
+                    "GIT_TERMINAL_PROMPT", "GIT_ASKPASS", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+                    "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EXERIS_RUN")
+
 
 def argv(run_dir: str, worktree: str, readable, agy_command, *,
          home: str = os.environ["HOME"], uid: int = os.getuid(), bridge_dir: str | None = None,
          git_common_dir: str | None = None, docs_root: str | None = None,
-         program_dirs=()) -> list[str]:
+         program_dirs=(), secrets=(), environment=None) -> list[str]:
     """The bubblewrap command line that runs `agy_command` inside the plan the module states.
 
     Every path is mounted at its own name. `program_dirs` are the directories the client's and the
     server's programs are found in that the empty home or `/tmp` would hide; `bridge_dir` and
-    `docs_root` are mounted only when given.
+    `docs_root` are mounted only when given. `secrets` are files covered by an empty one where the
+    empty filesystems leave them visible. Of `environment` (the launcher's own, by default) only
+    `KEPT_ENVIRONMENT` is passed in.
     """
+    environment = kept(os.environ if environment is None else environment)
     agy_home = drive.home(run_dir)
     runtime = f"/run/user/{uid}"
     out = [BWRAP, "--die-with-parent", "--unshare-pid",
            "--ro-bind", "/", "/",
            "--tmpfs", "/tmp",
            "--tmpfs", home,
+           "--tmpfs", run_dir,
            "--dev", "/dev",
            "--proc", "/proc"]
     for path in (worktree, agy_home, git_common_dir):
@@ -88,14 +119,27 @@ def argv(run_dir: str, worktree: str, readable, agy_command, *,
             if _within(covered, path):
                 raise ValueError(f"{path} holds {covered}, which the sandbox exists to hide")
         out += ["--ro-bind", path, path]
+    for path in _unique(secrets):
+        if os.path.isfile(path) and not _hidden(path, home, run_dir):
+            out += ["--ro-bind", os.devnull, path]
     bus = os.path.join(runtime, "bus")
     out += ["--tmpfs", runtime,
             "--bind-try", bus, bus,
             "--remount-ro", home,
-            "--setenv", "HOME", agy_home,
+            "--remount-ro", run_dir,
+            "--clearenv"]
+    for key in KEPT_ENVIRONMENT:
+        if key in environment:
+            out += ["--setenv", key, environment[key]]
+    out += ["--setenv", "HOME", agy_home,
             "--chdir", worktree,
             "--", *agy_command]
     return out
+
+
+def kept(environment) -> dict[str, str]:
+    """The variables of `environment` that cross into the sandbox."""
+    return {key: environment[key] for key in KEPT_ENVIRONMENT if key in environment}
 
 
 def _unique(paths) -> list[str]:
@@ -157,9 +201,9 @@ def _within(path: str, top: str) -> bool:
     return os.path.commonpath([os.path.abspath(path), os.path.abspath(top)]) == os.path.abspath(top)
 
 
-def _hidden(path: str, home: str) -> bool:
-    """Whether the empty home or `/tmp` covers `path` inside the sandbox."""
-    return any(_within(path, top) for top in (home, "/tmp"))
+def _hidden(path: str, home: str, run_dir: str | None = None) -> bool:
+    """Whether the empty home, `/tmp` or run directory covers `path` inside the sandbox."""
+    return any(_within(path, top) for top in (home, "/tmp", run_dir) if top)
 
 
 def program_dirs(programs, home: str) -> list[str]:
@@ -189,16 +233,24 @@ def main(args) -> int:
     run_dir, agy_command = os.path.abspath(args[0]), args[2:]
     home = os.environ["HOME"]
     worktree = os.getcwd()
+    try:
+        cfg = config.load()
+    except config.ConfigError as exc:
+        print(f"exeris-agent: {exc}; without it the App's key cannot be hidden from the client, "
+              f"and the run is refused", file=sys.stderr)
+        return 2
+    secrets = [path for path in (cfg.key_path, cfg.age_identity_path) if path]
     bridge_dir, docs_root = server(run_dir)
     programs = [agy_command[0]] + ([bridge.PROGRAM] if bridge_dir else [])
     try:
         command = argv(run_dir, worktree, readable_dirs(agy_command[1:]), agy_command, home=home,
                        bridge_dir=bridge_dir, git_common_dir=common_dir(worktree),
-                       docs_root=docs_root, program_dirs=program_dirs(programs, home))
+                       docs_root=docs_root, program_dirs=program_dirs(programs, home),
+                       secrets=secrets)
     except ValueError as exc:
         print(f"exeris-agent: {exc}; the run is refused", file=sys.stderr)
         return 2
-    os.execvp(BWRAP, command)
+    os.execvpe(BWRAP, command, kept(os.environ))
     return 127
 
 
