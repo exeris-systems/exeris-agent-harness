@@ -10,6 +10,11 @@ The file is read when a run opens and its content is recorded then: the task fil
 `preserve` patterns, and their digest. A registry edited after the run opened would otherwise
 change what the run is judged against in the middle of it.
 
+A task may also name its `base`: the commit of the repository every arm starts from. A task is
+planned against a state of the repository, and a task whose work later lands on the default branch
+would otherwise be opened against a tree in which it is already done. Without a `base`, a run starts
+from the default branch as it stands.
+
 `preserve_sha256` is the SHA-256 of the patterns as compact JSON in the order the task lists them —
 `json.dumps(patterns, separators=(",", ":"), ensure_ascii=False)`, UTF-8 — so two runs recorded
 with the same digest were judged under the same list.
@@ -25,6 +30,9 @@ TASKS = ("registry", "tasks")
 
 #: A task id as the registry names its files. A `reg:` reference of any other shape names no file.
 _TASK_ID = re.compile(r"T-[0-9]{1,8}")
+
+#: A commit as a task names its base: the full object id, never a ref that could move.
+_COMMIT = re.compile(r"[0-9a-f]{40}")
 
 #: The reference a registered run carries.
 PREFIX = "reg:"
@@ -61,12 +69,8 @@ def _preserve(document: dict, path: str) -> list[str]:
     return list(patterns)
 
 
-def oracle_inputs(root: str, task: str) -> dict:
-    """`{"task_sha256", "preserve", "preserve_sha256"}` for a `reg:` task, or `RegistryError`.
-
-    The task's record has to name itself by the id the run was opened with: a file that answers to
-    another id is another task's plan.
-    """
+def _document(root: str, task: str) -> tuple[dict, bytes, str]:
+    """The task's record, its bytes and its path, or `RegistryError`."""
     task_id = task[len(PREFIX):] if task.startswith(PREFIX) else ""
     if not _TASK_ID.fullmatch(task_id):
         raise RegistryError(f"--task {task!r} names no task file the registry keeps")
@@ -79,6 +83,47 @@ def oracle_inputs(root: str, task: str) -> dict:
         raise RegistryError(f"the record of {task_id} could not be read: {exc}") from None
     if not isinstance(document, dict) or document.get("id") != task_id:
         raise RegistryError(f"{path} is not the record of {task_id}")
+    return document, body, path
+
+
+def plan(root: str, task: str) -> dict:
+    """`{"oracle_inputs", "base"}` for a `reg:` task, from ONE read of its record.
+
+    The digest recorded in `oracle_inputs` and the base the run starts from describe the same bytes:
+    two reads of a record edited between them would record a digest of one plan and start the run
+    from another.
+    """
+    document, body, path = _document(root, task)
+    return {"oracle_inputs": _inputs(document, body, path), "base": _base(document, path)}
+
+
+def task_base(root: str, task: str) -> str | None:
+    """The commit a registered task names as every arm's starting point, or nothing.
+
+    `RegistryError` where the record cannot be read or names a base that is not a full commit id.
+    """
+    return plan(root, task)["base"]
+
+
+def _base(document: dict, path: str) -> str | None:
+    base = document.get("base")
+    if base is None:
+        return None
+    if not isinstance(base, str) or not _COMMIT.fullmatch(base):
+        raise RegistryError(f"{path}: base is not a full commit id")
+    return base
+
+
+def oracle_inputs(root: str, task: str) -> dict:
+    """`{"task_sha256", "preserve", "preserve_sha256"}` for a `reg:` task, or `RegistryError`.
+
+    The task's record has to name itself by the id the run was opened with: a file that answers to
+    another id is another task's plan.
+    """
+    return plan(root, task)["oracle_inputs"]
+
+
+def _inputs(document: dict, body: bytes, path: str) -> dict:
     patterns = _preserve(document, path)
     return {"task_sha256": hashlib.sha256(body).hexdigest(),
             "preserve": patterns,

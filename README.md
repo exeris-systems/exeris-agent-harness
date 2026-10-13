@@ -205,8 +205,11 @@ body_check      = "…"      # the organisation's `scripts/pr_body_check.py`, in
 [registry]
 path            = "…"      # the local clone of the private task registry. A `reg:T-NNN` run reads
                            # `registry/tasks/T-NNN.json` there when it opens and records the task's
-                           # `oracle_inputs.preserve`; a task file that cannot be read refuses the
-                           # run. Without it no task tells the oracle anything
+                           # `oracle_inputs.preserve`, and opens the run's worktree at the task's
+                           # `base` commit where it names one — every arm of a task starts from the
+                           # state it was planned against, even after its work has landed. A base
+                           # outside the default branch's history, or a task file that cannot be
+                           # read, refuses the run. Without it no task tells the oracle anything
 
 [repos.exeris-docs]         # the bare name; `[repos."exeris-systems/exeris-docs"]` names the
                             # same repository, so a vocabulary configured either way is enforced

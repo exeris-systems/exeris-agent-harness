@@ -90,11 +90,25 @@ def default_branch(clone: str) -> str:
                         f"run `git remote set-head origin --auto`")
 
 
-def add(clone: str, worktree: str, branch: str, base: str) -> str:
-    """Create the run's worktree on a new branch off `origin/<base>`, and return its base commit."""
+def add(clone: str, worktree: str, branch: str, base: str, commit: str | None = None) -> str:
+    """Create the run's worktree on a new branch, and return its base commit.
+
+    Off `origin/<base>`, or off `commit` where the task names one. A named commit has to be in the
+    default branch's history: a task's starting point is a state the repository was in, not a
+    commit from a branch nobody merged.
+    """
     if git(clone, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False):
         raise WorktreeError(f"branch {branch} already exists in {clone}")
-    git(clone, "worktree", "add", "-b", branch, worktree, f"origin/{base}")
+    start = f"origin/{base}"
+    if commit:
+        if not git(clone, "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}", check=False):
+            raise WorktreeError(f"the task's base {commit} is not in {clone}; fetch it first")
+        ancestor = subprocess.run(["git", "-C", clone, "merge-base", "--is-ancestor", commit, start],
+                                  capture_output=True, text=True)
+        if ancestor.returncode != 0:
+            raise WorktreeError(f"the task's base {commit} is not in the history of {start}")
+        start = commit
+    git(clone, "worktree", "add", "-b", branch, worktree, start)
     return git(worktree, "rev-parse", "HEAD")
 
 
