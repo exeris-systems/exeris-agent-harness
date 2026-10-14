@@ -87,9 +87,11 @@ def write_text(run_dir: str, name: str, text: str, mode: int = SECRET_MODE) -> s
     target = os.path.join(run_dir, name)
     os.makedirs(os.path.dirname(target), mode=DIR_MODE, exist_ok=True)
     descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    # On the open file and before the text: a file that already existed with a wider mode is
+    # narrowed before it holds what is written now.
+    os.fchmod(descriptor, mode)
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         handle.write(text)
-    os.chmod(target, mode)
     return target
 
 
@@ -328,6 +330,32 @@ def write_env(run_dir: str, values: dict[str, str]) -> str:
     ]
     lines += [f"export {key}={_shell_value(value)}" for key, value in values.items()]
     return write_text(run_dir, "env", "\n".join(lines) + "\n")
+
+
+def replace_env_value(run_dir: str, key: str, value: str) -> bool:
+    """Rewrite the one `export <key>=` line of `<run>/env`, leaving every other byte as it was.
+
+    The file is written once by `write_env` and read by a person's shell, so a value that changes
+    while the run is open is changed in place rather than by writing the file again from a mapping
+    the caller would have to reconstruct. Answers whether a line was there to rewrite; a file
+    without one is left untouched.
+    """
+    target = os.path.join(run_dir, "env")
+    try:
+        with open(target, encoding="utf-8", newline="") as handle:
+            lines = handle.read().splitlines(keepends=True)
+    except OSError:
+        return False
+    prefix = f"export {key}="
+    found = False
+    for index, line in enumerate(lines):
+        if line.startswith(prefix):
+            ending = line[len(line.rstrip("\r\n")):]
+            lines[index] = f"{prefix}{_shell_value(value)}{ending}"
+            found = True
+    if found:
+        write_text(run_dir, "env", "".join(lines))
+    return found
 
 
 def write_manifest(run_dir: str, manifest: dict) -> str:

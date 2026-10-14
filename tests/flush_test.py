@@ -230,6 +230,7 @@ class FlushTest(support.HarnessFixture):
             json.dumps({"visibility": "enterprise-private"}, indent=2) + "\n")
         self.git("add", "-A", cwd=self.execution)
         self.git("commit", "-m", "chore: the inbox says which inbox it is", cwd=self.execution)
+        self.git("push", "origin", "main", cwd=self.execution)
 
         self.assertEqual(0, self._flush())
         self.assertEqual([], self._on_branch(), "a public row was filed in an inbox that declares "
@@ -259,6 +260,123 @@ class FlushTest(support.HarnessFixture):
         (self.execution / "inbox" / "a-file-somebody-was-editing.json").write_text("{}\n")
         self.assertEqual(2, self._flush(), "flush committed into a tree it did not own")
         self.assertEqual([], self._on_branch())
+
+    # ---- the clones a flush commits into -----------------------------------------
+
+    def _pushed_elsewhere(self, name):
+        """A commit another producer pushed to the origin of `name` since the clone last looked."""
+        other = self.tmp / f"{name}-other-producer"
+        self.git("clone", "-q", str(self.tmp / f"{name}.git"), str(other))
+        (other / "another-producer.txt").write_text("placeholder: somebody else's commit\n")
+        self.git("add", "-A", cwd=other)
+        self.git("commit", "-q", "-m", "chore: another producer", cwd=other)
+        self.git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=other)
+        return self.git("rev-parse", "HEAD", cwd=other).stdout.strip()
+
+    def _committed_locally(self, clone):
+        (clone / "local-only.txt").write_text("placeholder: a commit nobody pushed\n")
+        self.git("add", "-A", cwd=clone)
+        self.git("commit", "-q", "-m", "chore: a commit nobody pushed", cwd=clone)
+
+    def test_a_streams_clone_behind_its_remote_is_brought_up_before_the_commit(self):
+        self._staged_run()
+        theirs = self._pushed_elsewhere("exeris-ai-execution-streams")
+
+        self.assertEqual(0, self._flush(), self.said)
+
+        origin = self.tmp / "exeris-ai-execution-streams.git"
+        tip = self.git("rev-parse", "refs/heads/main", cwd=origin).stdout.strip()
+        self.assertEqual(tip, self.git("rev-parse", "HEAD", cwd=self.streams).stdout.strip())
+        self.assertEqual(0, self.git("merge-base", "--is-ancestor", theirs, tip, cwd=origin,
+                                     check=False).returncode,
+                         "the other producer's commit is not under the flush's")
+        self.assertIn(f"/{self.run_id()}.jsonl", self.staged_row()["execution"]["event_stream"]
+                      ["ref"])
+        self.assertNotIn("@pending", self.staged_rows()[0].read_text())
+
+    def test_a_streams_clone_with_commits_its_remote_lacks_is_refused(self):
+        self._staged_run()
+        self._committed_locally(self.streams)
+        origin = self.tmp / "exeris-ai-execution-streams.git"
+        before = self.git("rev-parse", "refs/heads/main", cwd=origin).stdout.strip()
+
+        self.assertEqual(2, self._flush(), "a flush pushed somebody's unpushed commit")
+        self.assertEqual(before, self.git("rev-parse", "refs/heads/main", cwd=origin)
+                         .stdout.strip())
+        self.assertIn("@pending", self.staged_rows()[0].read_text())
+
+    def test_an_execution_clone_behind_its_remote_is_brought_up_before_it_is_read(self):
+        self._staged_run()
+        theirs = self._pushed_elsewhere("exeris-ai-execution")
+
+        self.assertEqual(0, self._flush(), self.said)
+        self.assertEqual(theirs, self.git("rev-parse", "main", cwd=self.execution).stdout.strip())
+        self.assertEqual(1, len(self._on_branch()))
+
+    def test_an_execution_clone_with_commits_its_remote_lacks_is_refused(self):
+        self._staged_run()
+        self._committed_locally(self.execution)
+        self.assertEqual(2, self._flush(), "a flush committed on top of an unpushed commit")
+        self.assertEqual([], self._on_branch())
+
+    def test_an_empty_flush_reads_no_clone_and_fetches_nothing(self):
+        self._committed_locally(self.execution)
+        self._pushed_elsewhere("exeris-ai-execution-streams")
+        before = self.git("rev-parse", "refs/remotes/origin/main", cwd=self.streams).stdout.strip()
+
+        self.assertEqual(0, self._flush(), self.said)
+        self.assertIn("no rows staged", self.said)
+        self.assertEqual(before, self.git("rev-parse", "refs/remotes/origin/main",
+                                          cwd=self.streams).stdout.strip(),
+                         "an empty flush fetched")
+
+    def test_a_clone_with_no_branch_checked_out_is_refused(self):
+        self._staged_run()
+        self.git("checkout", "-q", "--detach", cwd=self.streams)
+
+        self.assertEqual(2, self._flush(), "a flush committed onto a detached HEAD")
+        self.assertIn("no branch checked out", self.said)
+        self.assertIn("@pending", self.staged_rows()[0].read_text())
+
+    def test_a_clone_on_a_branch_origin_does_not_have_is_refused(self):
+        self._staged_run()
+        self.git("checkout", "-q", "-b", "somebody-s-topic", cwd=self.execution)
+
+        self.assertEqual(2, self._flush(), "a flush committed onto a branch origin lacks")
+        self.assertIn("which origin does not have", self.said)
+        self.assertEqual([], self._on_branch())
+
+    # ---- the pull request body ---------------------------------------------------
+
+    def test_the_body_names_every_date_directory_a_batch_spans(self):
+        import harness.record
+
+        body = harness.record.inbox_pull_request_body(
+            ["2026-10-14", "2026-10-13", "2026-10-14", "2026-10-14"], ["exeris-agent-harness"])
+        self.assertIn("4 run record(s) — 1 under `inbox/2026-10-13/runs/` and 3 under "
+                      "`inbox/2026-10-14/runs/`", body)
+
+    def test_the_body_of_a_batch_on_one_date_names_that_directory(self):
+        import harness.record
+
+        body = harness.record.inbox_pull_request_body(["2026-10-14", "2026-10-14"], ["a"])
+        self.assertIn("2 run record(s) under `inbox/2026-10-14/runs/`,", body)
+
+    def test_references_an_earlier_flush_resolved_are_counted_as_resolved(self):
+        self._staged_run()
+        path = self.staged_rows()[0]
+        whole = json.loads(path.read_text())
+        broken = dict(whole)
+        broken.pop("oracle")
+        path.write_text(json.dumps(broken, indent=2, sort_keys=True) + "\n")
+        self.assertEqual(1, self._flush(), "a red validator let the batch through")
+        self.assertNotIn("@pending", path.read_text(), "the red flush resolved nothing")
+
+        resolved = json.loads(path.read_text())
+        resolved["oracle"] = whole["oracle"]
+        path.write_text(json.dumps(resolved, indent=2, sort_keys=True) + "\n")
+        self.assertEqual(0, self._flush(), self.said)
+        self.assertIn("1 stream reference(s) resolved", self.said)
 
 
 if __name__ == "__main__":

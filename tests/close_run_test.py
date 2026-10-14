@@ -355,6 +355,392 @@ class CloseRunTest(support.HarnessFixture):
         self.assertFalse(tree.exists(), "the run's tree was kept")
         self.assertEqual(1, len(self.staged_rows()))
 
+    # ---- the token the run acts on -----------------------------------------------
+
+    OLD_TOKEN = "ghs_OLDtokenOLDtokenOLDtoken9876"
+
+    def _spend_token(self, expires_at):
+        """The run's token as an arm that outlived the hour would leave it."""
+        run_dir = self.run_dir()
+        (run_dir / "token").write_text(f"{self.OLD_TOKEN}\n{expires_at}\n", encoding="utf-8")
+        env = run_dir / "env"
+        env.write_text(env.read_text(encoding="utf-8").replace(support.FAKE_TOKEN, self.OLD_TOKEN),
+                       encoding="utf-8")
+
+    def _recording_pushes(self):
+        """The environment every `git push` of the close is made in."""
+        import harness.cli
+
+        pushes = []
+
+        class Recording(harness.cli.Runner):
+            def git(self, cwd, *args, env=None, check=True):
+                if args and args[0] == "push":
+                    pushes.append(dict(env or {}))
+                return super().git(cwd, *args, env=env, check=check)
+
+        self.addCleanup(setattr, harness.cli, "Runner", harness.cli.Runner)
+        harness.cli.Runner = Recording
+        return pushes
+
+    def test_a_token_about_to_expire_is_minted_again_before_the_push(self):
+        import datetime
+
+        self.open_run()
+        self.commit()
+        self.place_session()
+        soon = (datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=60))
+        self._spend_token(soon.strftime("%Y-%m-%dT%H:%M:%SZ"))
+        env_before = (self.run_dir() / "env").read_text(encoding="utf-8").splitlines()
+        pushes = self._recording_pushes()
+
+        self.assertEqual(0, self._close())
+
+        self.assertEqual([support.FAKE_TOKEN], [push.get("GH_TOKEN") for push in pushes])
+        self.assertEqual([support.FAKE_TOKEN, support.FAKE_EXPIRY],
+                         (self.run_dir() / "token").read_text(encoding="utf-8").splitlines())
+        env_after = (self.run_dir() / "env").read_text(encoding="utf-8").splitlines()
+        self.assertEqual([line for line in env_before if not line.startswith("export GH_TOKEN=")],
+                         [line for line in env_after if not line.startswith("export GH_TOKEN=")])
+        self.assertIn(f"export GH_TOKEN='{support.FAKE_TOKEN}'", env_after)
+        for path in self.run_dir().rglob("*"):
+            if path.is_file():
+                self.assertNotIn(self.OLD_TOKEN.encode(), path.read_bytes(),
+                                 f"the spent token is still in {path}")
+
+    def test_a_renewed_token_is_written_to_files_only_the_owner_can_read(self):
+        import stat
+
+        self.open_run()
+        self.commit()
+        self.place_session()
+        self._spend_token("2020-01-01T00:00:00Z")
+        for name in ("token", "env"):
+            (self.run_dir() / name).chmod(0o644)
+
+        self.assertEqual(0, self._close())
+
+        self.assertIn(support.FAKE_TOKEN, (self.run_dir() / "token").read_text(encoding="utf-8"))
+        for name in ("token", "env"):
+            self.assertEqual(0o600, stat.S_IMODE((self.run_dir() / name).stat().st_mode),
+                             f"<run>/{name} holds the renewed token and others can read it")
+
+    def test_a_renewed_token_is_in_no_command_line(self):
+        import subprocess
+        from unittest import mock
+
+        self.open_run()
+        self.commit()
+        self.place_session()
+        self._spend_token("2020-01-01T00:00:00Z")
+        argvs = []
+        real_run = subprocess.run
+
+        def recording(args, *rest, **kwargs):
+            argvs.append([str(arg) for arg in (args if isinstance(args, (list, tuple))
+                                               else [args])])
+            return real_run(args, *rest, **kwargs)
+
+        with mock.patch("subprocess.run", recording):
+            self.assertEqual(0, self._close())
+
+        self.assertTrue(any("push" in argv for argv in argvs), "the close pushed nothing")
+        self.assertTrue(self.recorded_gh_argvs(), "the fake gh recorded no call")
+        for argv in argvs + self.recorded_gh_argvs():
+            self.assertFalse(any(support.FAKE_TOKEN in arg for arg in argv),
+                             f"the renewed token is on a command line: {argv[:3]}")
+
+    def test_a_token_past_its_expiry_is_minted_again_before_the_push(self):
+        self.open_run()
+        self.commit()
+        self.place_session()
+        self._spend_token("2020-01-01T00:00:00Z")
+        pushes = self._recording_pushes()
+        self.assertEqual(0, self._close())
+        self.assertEqual([support.FAKE_TOKEN], [push.get("GH_TOKEN") for push in pushes])
+
+    def test_a_token_that_cannot_be_minted_again_pushes_nothing(self):
+        import harness.cli
+        import harness.token
+
+        self.open_run()
+        self.commit()
+        self.place_session()
+        self._spend_token("2020-01-01T00:00:00Z")
+
+        def refusing(*_args, **_kwargs):
+            raise harness.token.TokenError("GitHub refused the installation token (401)")
+
+        original = harness.cli.main
+
+        def closing(argv):
+            # The fixture puts its own mint in place for every command; this one refuses.
+            harness.token.mint = refusing
+            return original(argv)
+
+        self.addCleanup(setattr, harness.cli, "main", original)
+        harness.cli.main = closing
+        self.assertEqual(2, self._close(), "a run with a spent token acted as the identity")
+        branch = self.manifest()["branch"]
+        self.assertFalse(self.git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}",
+                                  cwd=self.origin, check=False).stdout.strip(),
+                         "the branch was pushed")
+        self.assertEqual([], self.posted_pulls())
+
+    # ---- the tree the run started on ---------------------------------------------
+
+    def _closed(self):
+        return json.loads((self.run_dir() / "staging" / "closed.json").read_text())
+
+    def test_open_run_records_the_state_of_the_tree_it_created(self):
+        self.open_run()
+        self.assertIs(False, self.manifest()["start_dirty"])
+
+    def test_work_left_uncommitted_is_said_beside_the_run_and_not_on_the_row(self):
+        self.open_run()
+        self.commit()
+        self.place_session()
+        tree = self.worktree()
+        (tree / "left-behind.txt").write_text("work the arm never committed\n")
+
+        self.assertEqual(0, self._close("--remove-worktree"))
+
+        self.assertIs(False, self.staged_row()["repository_state"]["dirty"])
+        self.assertIs(True, self._closed()["left_uncommitted"])
+        self.assertTrue((tree / "left-behind.txt").exists(),
+                        "a tree holding uncommitted work was given back")
+
+    def _forget_start_state(self):
+        """The run's manifest with no `start_dirty`."""
+        manifest_path = self.run_dir() / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest.pop("start_dirty")
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+    def test_a_manifest_that_does_not_record_the_start_state_yields_no_row(self):
+        self.open_run()
+        self._forget_start_state()
+        self.commit()
+        self.place_session()
+
+        noticed = io.StringIO()
+        with contextlib.redirect_stderr(noticed):
+            self.assertEqual(0, self._close())
+        self.assertEqual([], self.staged_rows())
+        self.assertIn("start-state-unrecorded", noticed.getvalue())
+        self.assertEqual("start-state-unrecorded", self._closed()["reason"])
+        self.assertIs(False, self._closed()["row"])
+        self.assertEqual(1, len(self.posted_pulls()), "the pull request stands without a row")
+
+    def test_a_tree_that_started_dirty_is_recorded_dirty(self):
+        self.open_run()
+        manifest_path = self.run_dir() / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["start_dirty"] = True
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        self.commit()
+        self.place_session()
+
+        self.assertEqual(0, self._close())
+        self.assertIs(True, self.staged_row()["repository_state"]["dirty"])
+        self.assertIs(False, self._closed()["left_uncommitted"])
+
+    # ---- rebuilding a staged row -------------------------------------------------
+
+    def _restage(self, *extra):
+        noticed = io.StringIO()
+        with contextlib.redirect_stderr(noticed), contextlib.redirect_stdout(io.StringIO()) as out:
+            code = self.cli(["close-run", "--run", self.run_id(), "--restage", *extra])
+        self.said = out.getvalue() + noticed.getvalue()
+        return code
+
+    def _closed_without_left_uncommitted(self):
+        """A closed run whose staged row has `dirty: true` and whose `closed.json` has no
+        `left_uncommitted`."""
+        self._closed_run()
+        path = self.staged_rows()[0]
+        row = json.loads(path.read_text())
+        row["repository_state"]["dirty"] = True
+        path.write_text(json.dumps(row, indent=2, sort_keys=True) + "\n")
+        closed_path = self.run_dir() / "staging" / "closed.json"
+        closed = json.loads(closed_path.read_text())
+        closed.pop("left_uncommitted")
+        closed_path.write_text(json.dumps(closed, indent=2, sort_keys=True) + "\n")
+        return path, row
+
+    def test_restage_rebuilds_the_row_and_leaves_the_stream_as_it_was(self):
+        path, before = self._closed_without_left_uncommitted()
+        stream = self.staged_streams()[0]
+        stream_bytes = stream.read_bytes()
+        calls = len(self.gh_calls())
+        branch = self.manifest()["branch"]
+        pushed = self.git("rev-parse", f"refs/heads/{branch}", cwd=self.origin).stdout.strip()
+
+        self.assertEqual(0, self._restage(), self.said)
+
+        after = json.loads(path.read_text())
+        self.assertIs(False, after["repository_state"]["dirty"])
+        before["repository_state"]["dirty"] = False
+        self.assertEqual(before, after, "the restage changed more than the derivation did")
+        self.assertEqual(stream_bytes, stream.read_bytes())
+        self.assertEqual([stream], self.staged_streams())
+        self.assertIs(True, self._closed()["left_uncommitted"])
+        self.assertIn("repository_state.dirty: true -> false", self.said)
+        self.assertEqual(calls, len(self.gh_calls()), "a restage asked something of the forge")
+        self.assertEqual(pushed, self.git("rev-parse", f"refs/heads/{branch}",
+                                          cwd=self.origin).stdout.strip())
+
+    def test_restage_keeps_a_reference_an_earlier_flush_resolved(self):
+        path, _ = self._closed_without_left_uncommitted()
+        row = json.loads(path.read_text())
+        resolved = row["execution"]["event_stream"]["ref"].replace("@pending", "@" + "a" * 40)
+        row["execution"]["event_stream"]["ref"] = resolved
+        path.write_text(json.dumps(row, indent=2, sort_keys=True) + "\n")
+
+        self.assertEqual(0, self._restage(), self.said)
+        self.assertEqual(resolved, json.loads(path.read_text())["execution"]["event_stream"]["ref"])
+
+    def _close_named(self, run, *extra):
+        noticed = io.StringIO()
+        with contextlib.redirect_stderr(noticed), contextlib.redirect_stdout(io.StringIO()) as out:
+            try:
+                code = self.cli(["close-run", "--run", run, *extra])
+            except SystemExit as exit_:
+                code = exit_.code
+        self.said = out.getvalue() + noticed.getvalue()
+        return code
+
+    def test_a_run_value_that_is_not_a_run_id_is_refused_before_any_path_is_built(self):
+        self.open_run()
+        self.commit()
+        for extra in ((), ("--restage",)):
+            for value in ("../" + self.run_id(), self.run_id() + "/..", "x"):
+                with self.subTest(value=value, extra=extra):
+                    self.assertNotEqual(0, self._close_named(value, *extra))
+                    self.assertIn("is not a run id", self.said)
+        self.assertEqual([], self.posted_pulls())
+        self.assertFalse((self.state_root / "runs" / self.run_id() / "staging").exists())
+
+    def test_a_run_directory_that_resolves_outside_the_runs_root_is_refused(self):
+        self.open_run()
+        self.commit()
+        run = self.run_id()
+        real = self.state_root / "runs" / run
+        outside = self.tmp / "outside-the-runs-root"
+        real.rename(outside)
+        real.symlink_to(outside, target_is_directory=True)
+        for extra in ((), ("--restage",)):
+            with self.subTest(extra=extra):
+                self.assertEqual(2, self._close_named(run, *extra))
+                self.assertIn("names no directory under", self.said)
+        self.assertEqual([], self.posted_pulls())
+        self.assertFalse((outside / "staging").exists())
+
+    def test_restage_refuses_a_run_that_is_still_open(self):
+        self.open_run()
+        self.commit()
+        self.assertEqual(2, self._restage())
+        self.assertIn("still open", self.said)
+        self.assertEqual([], self.posted_pulls())
+
+    def test_restage_refuses_a_run_closed_with_no_row(self):
+        self.open_run()
+        self.commit()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(0, self._close())
+        self.assertEqual(2, self._restage())
+        self.assertIn("no row staged", self.said)
+
+    def test_restage_refuses_a_row_already_in_the_inbox(self):
+        path, _ = self._closed_without_left_uncommitted()
+        date = path.parent.parent.name
+        target = self.execution / "inbox" / date / "runs" / path.name
+        target.parent.mkdir(parents=True)
+        target.write_bytes(path.read_bytes())
+        self.git("add", "-A", cwd=self.execution)
+        self.git("commit", "-m", "feat(inbox): the row a flush carried", cwd=self.execution)
+        self.git("checkout", "-q", "-b", "elsewhere", "HEAD~1", cwd=self.execution)
+        before = path.read_bytes()
+
+        self.assertEqual(2, self._restage())
+        self.assertIn("flushed", self.said)
+        self.assertEqual(before, path.read_bytes())
+
+    def test_restage_refuses_a_row_filed_from_another_clone_since_the_last_fetch(self):
+        path, _ = self._closed_without_left_uncommitted()
+        date = path.parent.parent.name
+        other = self.tmp / "another-machine"
+        self.git("clone", "-q", str(self.tmp / "exeris-ai-execution.git"), str(other))
+        target = other / "inbox" / date / "runs" / path.name
+        target.parent.mkdir(parents=True)
+        target.write_bytes(path.read_bytes())
+        self.git("add", "-A", cwd=other)
+        self.git("-c", "user.name=Another Machine", "-c", "user.email=other@example.invalid",
+                 "commit", "-m", "feat(inbox): the row another flush carried", cwd=other)
+        self.git("push", "-q", "origin", "HEAD:refs/heads/inbox/harness/elsewhere", cwd=other)
+        before = path.read_bytes()
+
+        self.assertEqual(2, self._restage())
+        self.assertIn("flushed", self.said)
+        self.assertEqual(before, path.read_bytes())
+
+    def test_restage_fetches_the_execution_clone_as_the_person(self):
+        import subprocess
+        from unittest import mock
+
+        self._closed_without_left_uncommitted()
+        seen = []
+        real_run = subprocess.run
+
+        def recording(args, *rest, **kwargs):
+            if isinstance(args, (list, tuple)) and "fetch" in args:
+                seen.append(kwargs.get("env"))
+            return real_run(args, *rest, **kwargs)
+
+        with mock.patch.dict(os.environ, {"GH_TOKEN": "placeholder-run-token",
+                                          "GIT_AUTHOR_NAME": "exeris-agent[bot]"}), \
+                mock.patch("subprocess.run", recording):
+            self._restage()
+        self.assertTrue(seen, "restage fetched nothing")
+        for env in seen:
+            self.assertIsNotNone(env, "the fetch inherited the shell's environment")
+            self.assertNotIn("GH_TOKEN", env)
+            self.assertNotIn("GIT_AUTHOR_NAME", env)
+
+    def test_restage_refuses_when_the_execution_clone_cannot_fetch(self):
+        path, _ = self._closed_without_left_uncommitted()
+        self.git("remote", "set-url", "origin", str(self.tmp / "no-such-remote.git"),
+                 cwd=self.execution)
+        before = path.read_bytes()
+
+        self.assertEqual(2, self._restage())
+        self.assertIn("could not fetch", self.said)
+        self.assertEqual(before, path.read_bytes())
+
+    def test_restage_refuses_a_run_whose_manifest_does_not_record_the_start_state(self):
+        path, _ = self._closed_without_left_uncommitted()
+        self._forget_start_state()
+        before = path.read_bytes()
+        closed_before = (self.run_dir() / "staging" / "closed.json").read_bytes()
+
+        self.assertEqual(2, self._restage())
+        self.assertIn("start-state-unrecorded", self.said)
+        self.assertEqual(before, path.read_bytes())
+        self.assertEqual(closed_before, (self.run_dir() / "staging" / "closed.json").read_bytes())
+
+    def test_restage_does_not_fill_left_uncommitted_from_a_row_without_dirty(self):
+        path, row = self._closed_without_left_uncommitted()
+        row["repository_state"].pop("dirty")
+        path.write_text(json.dumps(row, indent=2, sort_keys=True) + "\n")
+
+        self.assertEqual(0, self._restage(), self.said)
+        self.assertNotIn("left_uncommitted", self._closed())
+        self.assertIs(False, json.loads(path.read_text())["repository_state"]["dirty"])
+
+    def test_restage_takes_nothing_but_the_run(self):
+        self._closed_without_left_uncommitted()
+        self.assertEqual(2, self._restage("--no-pr"))
+
     def _refusing_gh(self):
         """A `gh` that answers every call but the one asking what a repository is."""
         (self.bin / "gh").write_text(

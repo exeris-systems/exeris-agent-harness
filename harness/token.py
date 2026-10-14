@@ -23,6 +23,7 @@ branch is a relaxation of the encrypt-at-rest rule, stated as a trade-off in `po
 """
 
 import base64
+import datetime
 import json
 import os
 import shutil
@@ -33,7 +34,7 @@ import time
 import urllib.error
 import urllib.request
 
-from . import VERSION
+from . import VERSION, runstate
 
 API = "https://api.github.com"
 USER_AGENT = f"exeris-agent-harness/{VERSION}"
@@ -217,10 +218,60 @@ def write(run_dir: str, minted: dict) -> str:
 
     One value per line rather than JSON, because the credential helper that reads it is a shell
     one-liner and a parser in that position is a dependency the run does not need. 0600 because the
-    file is a bearer credential for as long as the hour lasts.
+    file is a bearer credential for as long as the hour lasts — set on the open file before the
+    token is written, so a file that already existed with a wider mode never holds a new token.
     """
     path = os.path.join(run_dir, "token")
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, KEY_MODE)
+    os.fchmod(descriptor, KEY_MODE)
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         handle.write(f"{minted['token']}\n{minted.get('expires_at', '')}\n")
     return path
+
+
+#: How long before its expiry a token is replaced rather than used. A push, a pull request and the
+#: label after it are made on one token, so the margin is what those calls are allowed to take.
+REFRESH_MARGIN_SECONDS = 300
+
+
+def _expiry_of(stamp: str) -> float | None:
+    """`expires_at` as epoch seconds, or nothing where it is not a timestamp."""
+    try:
+        when = datetime.datetime.fromisoformat(stamp.strip())
+    except (AttributeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.UTC)
+    return when.timestamp()
+
+
+def fresh(cfg, run_dir: str, *, margin: int = REFRESH_MARGIN_SECONDS, http=None, now=None) -> str:
+    """The run's token, minted again where it will not outlast the next `margin` seconds.
+
+    A run lasts as long as its work does, and its token an hour; the token is read where the run
+    acts as the identity, so that is where it is renewed. A token whose expiry cannot be read is
+    one nobody can say is still valid, and is replaced like an expired one. The replacement is
+    written over `<run>/token`, which the credential helper reads, so git is served the new value
+    without being told, and over the `GH_TOKEN` line of `<run>/env`, so a shell that sources the
+    run's environment afterwards carries it too; no other line of that file changes. A token that
+    is still good is returned as it is, and nothing is asked of the network.
+
+    The mint is the only source: a mint that fails raises, and nothing falls back to another
+    identity.
+    """
+    current, expires = "", ""
+    try:
+        with open(os.path.join(run_dir, "token"), encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+        current = lines[0].strip() if lines else ""
+        expires = lines[1].strip() if len(lines) > 1 else ""
+    except OSError:
+        pass
+    clock = now or time.time
+    deadline = _expiry_of(expires)
+    if current and deadline is not None and deadline - clock() > margin:
+        return current
+    minted = mint(cfg, http=http, now=now)
+    write(run_dir, minted)
+    runstate.replace_env_value(run_dir, "GH_TOKEN", minted["token"])
+    return minted["token"]

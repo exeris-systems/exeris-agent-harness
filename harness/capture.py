@@ -56,6 +56,9 @@ REASONS = (
     "credential-class-absent",
     "prompt-absent",
     "routine-unreadable",
+    # The manifest does not say whether the tree the run started on held uncommitted changes.
+    # `repository_state.dirty` is that state, and nothing observed at the close can stand in for it.
+    "start-state-unrecorded",
     # A component of the checkout the record hashes is in the tree at the commit the run started
     # from and could not be read out of it, or that commit does not resolve at all. Absent from the
     # tree is a state and hashes as one; unrecoverable is not.
