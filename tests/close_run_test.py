@@ -445,8 +445,8 @@ class CloseRunTest(support.HarnessFixture):
             self.assertEqual(0, self._close())
 
         self.assertTrue(any("push" in argv for argv in argvs), "the close pushed nothing")
-        self.assertTrue(self.gh_argvs(), "the fake gh recorded no call")
-        for argv in argvs + self.gh_argvs():
+        self.assertTrue(self.recorded_gh_argvs(), "the fake gh recorded no call")
+        for argv in argvs + self.recorded_gh_argvs():
             self.assertFalse(any(support.FAKE_TOKEN in arg for arg in argv),
                              f"the renewed token is on a command line: {argv[:3]}")
 
@@ -599,6 +599,42 @@ class CloseRunTest(support.HarnessFixture):
 
         self.assertEqual(0, self._restage(), self.said)
         self.assertEqual(resolved, json.loads(path.read_text())["execution"]["event_stream"]["ref"])
+
+    def _close_named(self, run, *extra):
+        noticed = io.StringIO()
+        with contextlib.redirect_stderr(noticed), contextlib.redirect_stdout(io.StringIO()) as out:
+            try:
+                code = self.cli(["close-run", "--run", run, *extra])
+            except SystemExit as exit_:
+                code = exit_.code
+        self.said = out.getvalue() + noticed.getvalue()
+        return code
+
+    def test_a_run_value_that_is_not_a_run_id_is_refused_before_any_path_is_built(self):
+        self.open_run()
+        self.commit()
+        for extra in ((), ("--restage",)):
+            for value in ("../" + self.run_id(), self.run_id() + "/..", "x"):
+                with self.subTest(value=value, extra=extra):
+                    self.assertNotEqual(0, self._close_named(value, *extra))
+                    self.assertIn("is not a run id", self.said)
+        self.assertEqual([], self.posted_pulls())
+        self.assertFalse((self.state_root / "runs" / self.run_id() / "staging").exists())
+
+    def test_a_run_directory_that_resolves_outside_the_runs_root_is_refused(self):
+        self.open_run()
+        self.commit()
+        run = self.run_id()
+        real = self.state_root / "runs" / run
+        outside = self.tmp / "outside-the-runs-root"
+        real.rename(outside)
+        real.symlink_to(outside, target_is_directory=True)
+        for extra in ((), ("--restage",)):
+            with self.subTest(extra=extra):
+                self.assertEqual(2, self._close_named(run, *extra))
+                self.assertIn("names no directory under", self.said)
+        self.assertEqual([], self.posted_pulls())
+        self.assertFalse((outside / "staging").exists())
 
     def test_restage_refuses_a_run_that_is_still_open(self):
         self.open_run()

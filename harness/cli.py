@@ -482,7 +482,7 @@ def cmd_open_run(args) -> int:
         runstate.write_gitconfig(run_dir, user_name=cfg.bot_login, user_email=cfg.noreply_email,
                                  org=cfg.org)
 
-        tree = os.path.join(run_dir, "wt")
+        tree = os.path.join(run_dir, TREE)
         branch = f"agent/{ulid.short(run_id)}"
         base_sha = worktree.add(clone, tree, branch, base_branch, commit=task_base)
         worktree.bind_identity(clone, tree, user_name=cfg.bot_login,
@@ -1098,7 +1098,7 @@ def _derived_again(cfg, net, run_dir: str, manifest: dict, closed: dict, stream:
                    found: dict, previous: dict) -> dict:
     """The row of a closed run, derived from what its close recorded and staged."""
     run_id = manifest["run_id"]
-    worktree_path = manifest.get("worktree") or ""
+    worktree_path = os.path.join(run_dir, TREE)
     if not os.path.isdir(worktree_path):
         # A tree given back at the close; the commits the row reads are in the clone it came from.
         worktree_path = worktree.resolve_clone(manifest["repo"], cfg)
@@ -1521,7 +1521,7 @@ def _open_baseline(args) -> int:
     run_id = ulid.new()
     run_dir = runstate.create(run_id)
     try:
-        tree = os.path.join(run_dir, "wt")
+        tree = os.path.join(run_dir, TREE)
         branch = f"baseline/{ulid.short(run_id)}"
         base_sha = worktree.add(clone, tree, branch, base_branch, commit=task_base)
         worktree.bind_settings(clone, tree, runstate.baseline_settings(run_dir))
@@ -2054,6 +2054,11 @@ def cmd_flush(args) -> int:
 #: Crockford's alphabet, the shape `ulid.new` writes and a run directory is named by.
 RUN_METAVAR = "<ULID>"
 _RUN_ID = re.compile(r"[0-9A-HJKMNP-TV-Z]{26}")
+
+
+#: A run's worktree, inside its directory: where `open-run` creates it and where every later
+#: command finds it, never read back from the run's own files.
+TREE = "wt"
 
 
 def _contained_run_dir(run: str) -> str:
