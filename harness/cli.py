@@ -1009,10 +1009,11 @@ def _filed(net, execution: str, date: str, run_id: str) -> str | None:
     that has been flushed is told apart by the inbox side: the path in the clone's working tree, or
     a commit on any of its refs — the batch branch a flush pushed is one of them — that touched it.
     The clone fetches its remote first: a row another machine's flush filed is on the remote's
-    refs, not yet on this clone's, and a clone that cannot fetch cannot say a row is unfiled.
+    refs, not yet on this clone's, and a clone that cannot fetch cannot say a row is unfiled. The
+    fetch is the person's, as every touch of this clone is, so the run's own token stays out of it.
     """
     try:
-        net.git(execution, "fetch", "--quiet", "origin")
+        net.git(execution, "fetch", "--quiet", "origin", env=_person_environment())
     except CommandError as exc:
         raise Refused(f"{execution} could not fetch its remote, so whether the row is already "
                       f"filed cannot be established: {exc}") from None
@@ -1145,7 +1146,7 @@ def _note_restaged(run_dir: str, closed: dict, previous: dict) -> None:
     """Rewrite `closed.json` with the moment of the restage."""
     if LEFT_UNCOMMITTED not in closed:
         # A `closed.json` without `left_uncommitted` takes its value from the staged row's
-        # `repository_state.dirty`, which was the state of the tree at the close.
+        # `repository_state.dirty`.
         dirty = (previous.get("repository_state") or {}).get("dirty")
         if isinstance(dirty, bool):
             closed[LEFT_UNCOMMITTED] = dirty

@@ -162,7 +162,9 @@ such a tree back.
 `close-run --run <ULID> --restage` rebuilds the staged row of a run that is closed and not yet
 flushed, with the derivation now in force, from what the close recorded: the manifest, the staged
 stream, the commits the row named, the staged judgement, the visibility and the moment of the close.
-It pushes nothing, asks nothing of the forge, needs no token and does not touch the tree; the staged
+It pushes nothing, needs no token and does not touch the tree; its one network call is a fetch of
+the execution clone's remote, made as the person as `flush` does, to establish that the row is not
+already filed. The staged
 stream is left byte for byte, a reference an earlier flush resolved is kept, and each field that
 changed is printed. A run that is open, that staged no row, whose manifest does not record
 `start_dirty`, or whose row the execution clone already holds — in its working tree or on any of

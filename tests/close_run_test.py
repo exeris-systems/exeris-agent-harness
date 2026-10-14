@@ -684,6 +684,29 @@ class CloseRunTest(support.HarnessFixture):
         self.assertIn("flushed", self.said)
         self.assertEqual(before, path.read_bytes())
 
+    def test_restage_fetches_the_execution_clone_as_the_person(self):
+        import subprocess
+        from unittest import mock
+
+        self._closed_without_left_uncommitted()
+        seen = []
+        real_run = subprocess.run
+
+        def recording(args, *rest, **kwargs):
+            if isinstance(args, (list, tuple)) and "fetch" in args:
+                seen.append(kwargs.get("env"))
+            return real_run(args, *rest, **kwargs)
+
+        with mock.patch.dict(os.environ, {"GH_TOKEN": "placeholder-run-token",
+                                          "GIT_AUTHOR_NAME": "exeris-agent[bot]"}), \
+                mock.patch("subprocess.run", recording):
+            self._restage()
+        self.assertTrue(seen, "restage fetched nothing")
+        for env in seen:
+            self.assertIsNotNone(env, "the fetch inherited the shell's environment")
+            self.assertNotIn("GH_TOKEN", env)
+            self.assertNotIn("GIT_AUTHOR_NAME", env)
+
     def test_restage_refuses_when_the_execution_clone_cannot_fetch(self):
         path, _ = self._closed_without_left_uncommitted()
         self.git("remote", "set-url", "origin", str(self.tmp / "no-such-remote.git"),
