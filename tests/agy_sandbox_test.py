@@ -29,7 +29,7 @@ import support  # noqa: E402,F401  — the fixture, which puts the checkout on t
 
 from adapters.antigravity import drive as agy_drive  # noqa: E402
 from adapters.antigravity import sandbox  # noqa: E402
-from harness import bridge  # noqa: E402
+from harness import bridge, pr_body  # noqa: E402
 
 _CANARY = "placeholder-canary-must-not-be-read"
 
@@ -195,6 +195,20 @@ class ArgvTest(unittest.TestCase):
         separator = self.argv.index("--")
         self.assertEqual(["agy", "--add-dir", str(self.at.readable)], self.argv[separator + 1:])
 
+    def test_the_run_s_body_directory_is_bound_read_write_as_drive_passes_it(self):
+        body = self.at.run / pr_body.DIRECTORY
+        body.mkdir()
+        # The client's arguments exactly as a driven pass builds them: the readable directories,
+        # the run's body directory among them.
+        agy_args = agy_drive.arguments(readable=[str(self.at.readable), str(body)], resume=None)
+        argv = sandbox.argv(str(self.at.run), str(self.at.worktree),
+                            sandbox.readable_dirs(agy_args), ["agy", *agy_args],
+                            home=str(self.at.home), uid=4242, environment={})
+        self.assertIn((str(body), str(body)),
+                      [b[1:3] for b in _binds(argv, {"--bind"})])
+        self.assertNotIn(str(body), [b[1] for b in _binds(argv, {"--ro-bind"})])
+        self.assertIn(pr_body.VARIABLE, sandbox.KEPT_ENVIRONMENT)
+
     def test_a_mount_that_holds_the_home_or_the_runs_or_lies_among_the_runs_is_refused(self):
         for wide in (self.at.home, self.at.run, self.at.run.parent, self.at.sibling,
                      self.at.home.parent):
@@ -235,7 +249,9 @@ class ConfinedTest(unittest.TestCase):
         configuration.write_text('[github]\nclient_id = "placeholder"\ninstallation_id = 1\n'
                                  f'bot_user_id = 1\nprivate_key = "{at.key}"\n',
                                  encoding="utf-8")
+        (at.run / pr_body.DIRECTORY).mkdir(exist_ok=True)
         environment = {"PATH": os.environ["PATH"], "HOME": str(at.home),
+                       pr_body.VARIABLE: str(at.run / pr_body.DIRECTORY / pr_body.FILE),
                        "EXERIS_AGENT_CONFIG": str(configuration),
                        "GH_TOKEN": _CANARY + "-environment",
                        "GITHUB_TOKEN": _CANARY + "-environment"}
@@ -251,12 +267,15 @@ class ConfinedTest(unittest.TestCase):
             f"tr '\\0' '\\n' < /proc/self/environ; env; "
             f"for p in /proc/[0-9]*/environ; do tr '\\0' '\\n' < $p; done; "
             f"cat readme.txt; echo written > out.txt; "
+            f"echo body > \"${pr_body.VARIABLE}\"; "
             f"echo x > '{at.run / 'planted'}' && echo planted", at=at)
         self.assertIn("placeholder: the tree", done.stdout)
         self.assertIn("PATH=", done.stdout)
         self.assertNotIn(_CANARY, done.stdout + done.stderr)
         self.assertNotIn("planted", done.stdout)
         self.assertEqual("written\n", (at.worktree / "out.txt").read_text(encoding="utf-8"))
+        self.assertEqual("body\n", (at.run / pr_body.DIRECTORY / pr_body.FILE).read_text(
+            encoding="utf-8"))
         self.assertFalse((at.run / "planted").exists())
         self.assertEqual(_CANARY + "-token\n", at.token.read_text(encoding="utf-8"))
 
