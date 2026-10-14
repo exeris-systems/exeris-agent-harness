@@ -312,6 +312,20 @@ OBSERVED = "observed"
 #: Where the manifest records what a pass of the arm was allowed, in its client's own grammar.
 PERMISSIONS_KEY = "permissions"
 
+#: Where the manifest records whether the run's tree held uncommitted changes when it was created.
+START_DIRTY = "start_dirty"
+
+
+def _start_dirty(manifest: dict) -> bool:
+    """Whether the tree the run started on was dirty, as `open-run` recorded it.
+
+    A manifest that does not carry the field reads as clean, and that is a statement about how
+    every run was opened rather than a default: `open-run` creates the run's tree fresh with
+    `git worktree add` at the base commit, so the tree it starts on holds exactly that commit and
+    nothing uncommitted.
+    """
+    return bool(manifest.get(START_DIRTY, False))
+
 
 def _task_plan(cfg, task: str) -> tuple[dict | None, str | None]:
     """`(oracle inputs, base)` of a registered task, from one read of its record.
@@ -471,6 +485,9 @@ def cmd_open_run(args) -> int:
         worktree.bind_identity(clone, tree, user_name=cfg.bot_login,
                                user_email=cfg.noreply_email,
                                settings=runstate.worktree_settings(run_dir, cfg.org))
+        # The tree the run is measured on, as it stood before anything was done in it. Taken here
+        # and nowhere later: what the tree holds at the close is what the arm left behind.
+        start_dirty = bool(worktree.git(tree, "status", "--porcelain"))
 
         runstate.write_hook(run_dir, run_id)
 
@@ -498,6 +515,9 @@ def cmd_open_run(args) -> int:
             "worktree": tree,
             "branch": branch,
             "base_sha": base_sha,
+            # `repository_state.dirty` on the row: the state the run started on, which every arm
+            # of a group shares, and not the state any one arm left.
+            START_DIRTY: start_dirty,
             "owner_login": cfg.owner_login,
             "principal": {"kind": PRINCIPAL_KIND, "login": cfg.bot_login},
             "scope": scope,
@@ -546,9 +566,9 @@ def cmd_open_run(args) -> int:
 def _expiry(run_dir: str) -> str:
     """The run token's expiry as the listing shows it, `expired` once the hour has passed.
 
-    An installation token lasts an hour and an agent session routinely lasts longer, so the end of
-    a long run is otherwise a push refused with a message about authentication rather than about
-    time. V0 does not refresh a token; it says when one is spent.
+    An installation token lasts an hour and an agent session routinely lasts longer. `close-run`
+    mints a new one before it acts as the identity; until then, a shell working in the run holds
+    the one it sourced, and this column says when that one is spent.
     """
     try:
         with open(os.path.join(run_dir, "token"), encoding="utf-8") as handle:
@@ -598,6 +618,10 @@ AGENTS_FILE = "AGENTS.md"
 #: second time or ask for a second pull request.
 CLOSED = "closed.json"
 
+#: Where `closed.json` says whether the arm left uncommitted changes in its tree. The row has no
+#: field for it: its `repository_state` is the tree the run started on.
+LEFT_UNCOMMITTED = "left_uncommitted"
+
 #: The label the template gate reads beside a `Refs:` line, on a pull request that touches an ADR.
 ADR_LABEL = "adr"
 
@@ -644,15 +668,16 @@ def _stage_judgement(run_dir: str, judgement: dict, *, run_id: str, domain: str)
 def _run_environment(run_dir: str, manifest: dict, cfg) -> dict:
     """The environment the run's own calls are made in — the one `open-run` printed.
 
-    Reconstructed rather than remembered: the token is the file the mint wrote, and the rest is the
-    same mapping the env file exports. What the person's shell carried is dropped first, because a
-    variable the harness never sets is a variable the harness never closed.
+    Reconstructed rather than remembered: the token is the file the mint wrote — minted again first
+    where it would not outlast the calls about to be made on it — and the rest is the same mapping
+    the env file exports. What the person's shell carried is dropped first, because a variable the
+    harness never sets is a variable the harness never closed.
     """
     try:
-        with open(os.path.join(run_dir, "token"), encoding="utf-8") as handle:
-            minted = handle.read().splitlines()[0].strip()
-    except (OSError, IndexError):
-        minted = ""
+        minted = token.fresh(cfg, run_dir)
+    except token.TokenError as exc:
+        raise Refused(f"run {manifest['run_id']} holds no token that is still valid and a new one "
+                      f"could not be minted: {exc}; nothing was pushed") from None
     if not minted:
         raise Refused(f"run {manifest['run_id']} has no token; it cannot act as the identity")
     environment = {key: value for key, value in os.environ.items() if key not in runstate.UNSET}
@@ -718,9 +743,12 @@ def _title(net, worktree_path: str, commits: list, run_id: str) -> str:
     return f"chore(agent): run {ulid.short(run_id)}"
 
 
-def _row(args, cfg, net, manifest, *, worktree_path, visibility, dirty, commits,
+def _row(override, cfg, net, manifest, *, worktree_path, visibility, dirty, commits,
          ended_at, judgement, driven) -> tuple[dict | None, str | None, str | None]:
     """`(row, session path, reason)` — the run record, or why there is not one.
+
+    `override` is a session log named rather than searched for: the person's `--session`, or the
+    stream a closed run already staged.
 
     Every refusal reaches here as `NoRow` and leaves as a reason, because a run that cannot be
     recorded is not a run that failed: its commits are pushed and its pull request is open, and
@@ -732,7 +760,7 @@ def _row(args, cfg, net, manifest, *, worktree_path, visibility, dirty, commits,
         module = _session_module(adapter)
         if module is None:
             raise capture.NoRow("adapter-identity-only", adapter)
-        session = module.locate(manifest, override=args.session)
+        session = module.locate(manifest, override=override)
         # An adapter with no search to make answers the pair rather than raising, because it has
         # nothing to have failed at: there is no log it has ever read.
         if not isinstance(session, str):
@@ -829,6 +857,11 @@ def cmd_close_run(args) -> int:
         # recorded is the one thing this command must not do quietly.
         raise Refused(f"the manifest of {args.run} names no provider table; it was opened by a "
                       f"harness that did not record the arm, and nothing here can reconstruct it")
+    if args.restage:
+        if args.no_pr or args.title or args.session or args.remove_worktree:
+            raise Refused("--restage rebuilds a staged row from what the close recorded and takes "
+                          "nothing but --run")
+        return _restage(cfg, run_dir, manifest)
     staging = os.path.join(run_dir, "staging")
     if os.path.exists(os.path.join(staging, CLOSED)):
         raise Refused(f"{args.run} was closed already; what it staged is under {staging}")
@@ -846,7 +879,10 @@ def cmd_close_run(args) -> int:
     manifest = dict(manifest, ended_at=ended_at)
     run_id, repo, branch = manifest["run_id"], manifest["repo"], manifest["branch"]
 
-    dirty = bool(net.git(worktree_path, "status", "--porcelain"))
+    # What the arm left uncommitted. It decides whether the tree may be given back, and it is said
+    # beside the run; it is not the row's `repository_state.dirty`, which describes the tree the
+    # run started on and is therefore the same for every arm of a group.
+    left_uncommitted = bool(net.git(worktree_path, "status", "--porcelain"))
     commits = net.git_lines(worktree_path, "rev-list", "--reverse",
                             f"{manifest['base_sha']}..HEAD")
     # A commit the hook did not stamp is a commit the record cannot claim: the trailer is the only
@@ -899,9 +935,10 @@ def cmd_close_run(args) -> int:
         driven = drive.read_record(run_dir)
     except capture.NoRow as refusal:
         driven = refusal
-    row, session, reason = _row(args, cfg, net, manifest, worktree_path=worktree_path,
-                                visibility=visibility, dirty=dirty, commits=commits,
-                                ended_at=ended_at, judgement=judgement, driven=driven)
+    row, session, reason = _row(args.session, cfg, net, manifest, worktree_path=worktree_path,
+                                visibility=visibility, dirty=_start_dirty(manifest),
+                                commits=commits, ended_at=ended_at, judgement=judgement,
+                                driven=driven)
 
     date = record.date_of(manifest["started_at"])
     os.makedirs(staging, mode=runstate.DIR_MODE, exist_ok=True)
@@ -930,12 +967,156 @@ def cmd_close_run(args) -> int:
         "reason": reason,
         "pull_request": pull_request,
         "unattributed_commits": len(unattributed),
+        LEFT_UNCOMMITTED: left_uncommitted,
     }, indent=2, sort_keys=True) + "\n")
 
     if pull_request:
         print(pull_request)
     if args.remove_worktree:
-        _remove_worktree(net, worktree_path, dirty)
+        _remove_worktree(net, worktree_path, left_uncommitted)
+    elif left_uncommitted:
+        print(f"exeris-agent: {run_id} left uncommitted changes in {worktree_path}; they are not "
+              f"part of what was pushed", file=sys.stderr)
+    return EXIT_OK
+
+
+def _filed(net, execution: str, date: str, run_id: str) -> str | None:
+    """Where the execution clone already holds a run's row, or nothing where it holds none.
+
+    `flush` leaves staging in place and copies each row it carries into the inbox, so a staged row
+    that has been flushed is told apart by the inbox side: the path in the clone's working tree, or
+    a commit on any of its refs — the batch branch a flush pushed is one of them — that touched it.
+    """
+    inside = f"inbox/{date}/runs/{run_id}.json"
+    if os.path.exists(os.path.join(execution, inside)):
+        return os.path.join(execution, inside)
+    touched = net.git(execution, "log", "--all", "-1", "--format=%H", "--", inside, check=False)
+    if touched:
+        return f"{inside} at {touched[:8]} in {execution}"
+    return None
+
+
+def _staged_judgement(run_dir: str) -> dict:
+    """The judgement a closed run's row was derived from, read back from what the close staged.
+
+    The oracle is not asked again: a row is interpretable against the judgement and the calibration
+    in force when the run was closed, and the tree it judged need not still be there.
+    """
+    path = os.path.join(run_dir, "staging", JUDGEMENT_FILE)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            staged = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise Refused(f"{path} cannot be read ({exc}); the judgement the row was derived from is "
+                      f"what a rebuilt row has to carry") from None
+    return {"version": staged.get("oracle_version"), "outcome": staged.get("outcome"),
+            "calibration": staged.get("calibration") or {}, "gates": staged.get("gates") or [],
+            "reason": staged.get("reason") or "", oracle.BRIDGE: staged.get(oracle.BRIDGE)}
+
+
+def _leaves(value, prefix: str = "") -> dict:
+    """A JSON value as `{dotted path: leaf}`, so two rows can be compared field by field."""
+    if isinstance(value, dict) and value:
+        out = {}
+        for key, inner in value.items():
+            out.update(_leaves(inner, f"{prefix}.{key}" if prefix else str(key)))
+        return out
+    return {prefix: value}
+
+
+def _restage(cfg, run_dir: str, manifest: dict) -> int:
+    """Rebuild the staged row of a closed, unflushed run with the derivation now in force.
+
+    Derived again from what the close recorded — the manifest, the stream it staged, the commits
+    the row named, the judgement it staged, the visibility it established and the moment it closed
+    — so nothing is pushed, nothing is asked of the forge, no token is needed and the tree is not
+    touched. The staged stream is read and never written. A flushed row is a record, and records
+    are appended rather than rewritten, so a row the inbox side already holds is refused.
+    """
+    run_id = manifest["run_id"]
+    staging = os.path.join(run_dir, "staging")
+    closed_path = os.path.join(staging, CLOSED)
+    if not os.path.exists(closed_path):
+        raise Refused(f"{run_id} is still open: it has not been closed, so it staged no row to "
+                      f"rebuild — close it with `close-run --run {run_id}`")
+    try:
+        with open(closed_path, encoding="utf-8") as handle:
+            closed = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise Refused(f"{closed_path} cannot be read ({exc}); a restage rebuilds from what the "
+                      f"close recorded") from None
+
+    staged = [row for row in _staged_rows() if row["run_dir"] == run_dir
+              and row["run_id"] == run_id]
+    if not staged:
+        raise Refused(f"{run_id} was closed with no row staged "
+                      f"({closed.get('reason') or 'none was written'}); there is nothing to "
+                      f"rebuild")
+    if len(staged) > 1:
+        raise Refused(f"{run_id} has {len(staged)} staged rows: "
+                      f"{', '.join(row['path'] for row in staged)}")
+    found = staged[0]
+    net = Runner()
+    execution = _clone(cfg, "execution_repo_path", "a row is derived against the contract it "
+                                                   "publishes")
+    filed = _filed(net, execution, found["date"], run_id)
+    if filed:
+        raise Refused(f"{run_id} was flushed: its row is already in the inbox ({filed}); a filed "
+                      f"row is a record, and a record is not rebuilt")
+
+    name = manifest["repo"].split("/", 1)[1]
+    stream = os.path.join(staging, "streams", found["date"], name, f"{run_id}.jsonl")
+    if not os.path.isfile(stream):
+        raise Refused(f"{run_id} has no staged stream at {stream}; the row is derived from it")
+    with open(found["path"], encoding="utf-8") as handle:
+        previous = json.load(handle)
+
+    worktree_path = manifest.get("worktree") or ""
+    if not os.path.isdir(worktree_path):
+        # A tree given back at the close; the commits the row reads are in the clone it came from.
+        worktree_path = worktree.resolve_clone(manifest["repo"], cfg)
+    try:
+        driven = drive.read_record(run_dir)
+    except capture.NoRow as refusal:
+        driven = refusal
+    ended_at = closed.get("ended_at") or manifest.get("ended_at")
+    if not ended_at:
+        raise Refused(f"{closed_path} does not say when {run_id} was closed")
+    commits = list(((previous.get("execution") or {}).get("result_commits")) or [])
+    row, _session, reason = _row(stream, cfg, net, dict(manifest, ended_at=ended_at),
+                                 worktree_path=worktree_path, visibility=found["visibility"],
+                                 dirty=_start_dirty(manifest), commits=commits,
+                                 ended_at=ended_at, judgement=_staged_judgement(run_dir),
+                                 driven=driven)
+    if row is None:
+        raise Refused(f"the row of {run_id} cannot be derived again: {reason}; the staged row is "
+                      f"left as it was")
+
+    # A reference an earlier flush resolved names the commit its stream went in under, and the
+    # stream is the one staged here; the derivation only ever writes the pending mark.
+    before = ((previous.get("execution") or {}).get("event_stream") or {}).get("ref")
+    after = row["execution"]["event_stream"]["ref"]
+    if (isinstance(before, str) and "@pending" not in before
+            and before.split("@", 1)[0] == after.split("@", 1)[0]):
+        row["execution"]["event_stream"]["ref"] = before
+
+    old, new = _leaves(previous), _leaves(row)
+    changed = sorted(key for key in set(old) | set(new) if old.get(key) != new.get(key))
+    record.write(found["path"], row)
+
+    if LEFT_UNCOMMITTED not in closed:
+        # A close that did not record what the arm left behind wrote that state as the row's
+        # `dirty`; it is carried over to where it belongs before the row stops saying it.
+        closed[LEFT_UNCOMMITTED] = bool((previous.get("repository_state") or {}).get("dirty"))
+    closed["restaged_at"] = _now()
+    runstate.write_text(run_dir, os.path.join("staging", CLOSED),
+                        json.dumps(closed, indent=2, sort_keys=True) + "\n")
+
+    if not changed:
+        print(f"exeris-agent: {run_id} restaged; the row is unchanged")
+    for key in changed:
+        print(f"exeris-agent: {run_id}: {key}: {json.dumps(old.get(key))} -> "
+              f"{json.dumps(new.get(key))}")
     return EXIT_OK
 
 
@@ -1493,8 +1674,11 @@ def _stream_path(row: dict) -> str | None:
     return "streams/" + ref.split("/streams/", 1)[1].split("@", 1)[0]
 
 
-def _resolve_pending(rows: list, streams: str, sha: str) -> tuple[int, list]:
+def _resolve_pending(rows: list, streams: str, sha: str) -> tuple[int, int, list]:
     """Resolve each row's pending mark to the commit its own stream is in; answer the rest.
+
+    `(resolved now, resolved by an earlier flush, still pending)`: every row is in exactly one of
+    the three, so the count printed is the count of rows whose reference names a commit.
 
     Staging is the producer's own, and the rule that a record is appended and never rewritten
     begins where records are kept. A row that already names a commit is left alone: it names the
@@ -1505,7 +1689,7 @@ def _resolve_pending(rows: list, streams: str, sha: str) -> tuple[int, list]:
     stays behind: a reference that resolves to a path the commit does not carry is worse than one
     that says it is still pending.
     """
-    resolved, pending = 0, []
+    resolved, earlier, pending = 0, 0, []
     for row in rows:
         try:
             with open(row["path"], encoding="utf-8") as handle:
@@ -1515,6 +1699,7 @@ def _resolve_pending(rows: list, streams: str, sha: str) -> tuple[int, list]:
             pending.append(row)
             continue
         if "@pending" not in text:
+            earlier += 1
             continue
         inside = _stream_path(body)
         if not inside or not os.path.exists(os.path.join(streams, inside)):
@@ -1523,7 +1708,31 @@ def _resolve_pending(rows: list, streams: str, sha: str) -> tuple[int, list]:
         with open(row["path"], "w", encoding="utf-8") as handle:
             handle.write(text.replace("@pending", f"@{sha}"))
         resolved += 1
-    return resolved, pending
+    return resolved, earlier, pending
+
+
+def _fast_forward(net, clone: str, env=None) -> None:
+    """Bring a clone flush commits into up to its remote, or refuse.
+
+    Other producers push to the same repositories, so a clone left as it was at the last flush is
+    behind, and a commit made on top of it is a push the remote rejects. Fetched and fast-forwarded
+    before anything is read from it or written into it; a branch holding commits its remote does
+    not is somebody's work in progress, and is refused rather than carried with a batch.
+    """
+    branch = net.git(clone, "rev-parse", "--abbrev-ref", "HEAD", env=env)
+    if branch == "HEAD":
+        raise Refused(f"{clone} has no branch checked out; flush commits onto a branch and will "
+                      f"not guess which")
+    net.git(clone, "fetch", "origin", env=env)
+    upstream = f"refs/remotes/origin/{branch}"
+    if not net.git(clone, "rev-parse", "--verify", "--quiet", upstream, env=env, check=False):
+        raise Refused(f"{clone} is on {branch}, which origin does not have; flush pushes what it "
+                      f"commits there and needs the remote's branch to start from")
+    local = net.git_lines(clone, "rev-list", f"{upstream}..HEAD", env=env)
+    if local:
+        raise Refused(f"{clone} has {len(local)} commit(s) on {branch} that origin does not; push "
+                      f"or drop them before a flush commits on top of them")
+    net.git(clone, "merge", "--ff-only", "--quiet", upstream, env=env)
 
 
 def _validate(execution: str, rows: list) -> int:
@@ -1695,6 +1904,8 @@ def cmd_flush(args) -> int:
         if net.git(clone, "status", "--porcelain", env=person):
             raise Refused(f"{clone} has uncommitted changes; flush commits into it and will not "
                           f"carry somebody else's work in with a batch of rows")
+    for clone in (execution, streams):
+        _fast_forward(net, clone, env=person)
 
     declared = _declared_visibility(execution)
 
@@ -1704,9 +1915,9 @@ def cmd_flush(args) -> int:
         return EXIT_OK
 
     sha = _carry_streams(net, streams, rows, _staged_streams(), env=person)
-    resolved, pending = _resolve_pending(rows, streams, sha)
-    print(f"exeris-agent: {len(rows)} row(s) staged; {resolved} stream reference(s) resolved "
-          f"to {sha[:8]}")
+    resolved, earlier, pending = _resolve_pending(rows, streams, sha)
+    print(f"exeris-agent: {len(rows)} row(s) staged; {resolved + earlier} stream reference(s) "
+          f"resolved — {resolved} to {sha[:8]} now, {earlier} by an earlier flush")
     if pending:
         # Counted and kept back rather than carried: the reference is what makes the row's counts
         # checkable against the stream they were taken from, and one that names nothing is a row
@@ -1890,6 +2101,9 @@ def parser() -> argparse.ArgumentParser:
                                 "one")
     close_run.add_argument("--remove-worktree", action="store_true",
                            help="give the run's tree back to the clone once it is closed")
+    close_run.add_argument("--restage", action="store_true",
+                           help="rebuild the staged row of a run already closed and not yet "
+                                "flushed, from what its close recorded; pushes nothing")
     close_run.set_defaults(handler=cmd_close_run)
 
     flush = subcommands.add_parser(

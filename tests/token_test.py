@@ -172,7 +172,9 @@ def _secret_fragments(pem_path):
     return body
 
 
-class TokenMintTest(unittest.TestCase):
+class _KeyFixture(unittest.TestCase):
+    """A throwaway App key, a configuration naming it, and a state root of the test's own."""
+
     def setUp(self):
         self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="exeris-token-test-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
@@ -225,6 +227,9 @@ class TokenMintTest(unittest.TestCase):
             else os.environ.pop(n, None)
         )
 
+
+
+class TokenMintTest(_KeyFixture):
     def _mint(self):
         import harness.token
 
@@ -320,6 +325,97 @@ class TokenMintTest(unittest.TestCase):
         self.assertEqual(0o644, stat.S_IMODE(self.key_path.stat().st_mode))
         with self.assertRaises(Exception):
             harness.token.mint(_load_config(self.config_path), http=_FakeHttp())
+
+
+class TokenFreshTest(_KeyFixture):
+    """The run's token is renewed where the run acts on it, and only where it has to be.
+
+    A run outlives the hour its token is good for, and the token is read from `<run>/token` by the
+    credential helper and exported as `GH_TOKEN` by `<run>/env`. A renewal that missed either would
+    leave one path holding a spent credential; one that rewrote the env file wholesale would change
+    what a person's shell sources in ways nobody asked for.
+    """
+
+    NOW = 1_800_000_000
+    OLD_TOKEN = "ghs_OLDtokenOLDtokenOLDtoken9876"
+
+    def setUp(self):
+        super().setUp()
+        from harness import runstate
+
+        self.run_dir = self.state_root / "runs" / "01M00000000000000000000000"
+        self.run_dir.mkdir(parents=True)
+        runstate.write_env(str(self.run_dir), runstate.env_values(
+            str(self.run_dir), run_id="01M00000000000000000000000", token=self.OLD_TOKEN,
+            user_name=BOT_LOGIN, user_email="bot@example.invalid"))
+        self.env_before = (self.run_dir / "env").read_text(encoding="utf-8")
+
+    def _token_file(self, expires_at):
+        (self.run_dir / "token").write_text(f"{self.OLD_TOKEN}\n{expires_at}\n", encoding="utf-8")
+
+    def _stamp(self, seconds_from_now):
+        import datetime
+
+        return datetime.datetime.fromtimestamp(self.NOW + seconds_from_now, datetime.UTC) \
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _fresh(self, http):
+        import harness.token
+
+        return harness.token.fresh(_load_config(self.config_path), str(self.run_dir),
+                                   http=http, now=lambda: self.NOW)
+
+    def _assert_replaced(self, answer, http):
+        self.assertEqual(FAKE_TOKEN, answer)
+        self.assertEqual(1, len(http.calls), "the token was not minted again")
+        self.assertEqual([FAKE_TOKEN, FAKE_EXPIRY],
+                         (self.run_dir / "token").read_text(encoding="utf-8").splitlines())
+        before = self.env_before.splitlines(keepends=True)
+        after = (self.run_dir / "env").read_text(encoding="utf-8").splitlines(keepends=True)
+        self.assertEqual(len(before), len(after))
+        changed = [(old, new) for old, new in zip(before, after) if old != new]
+        self.assertEqual([(f"export GH_TOKEN='{self.OLD_TOKEN}'\n",
+                           f"export GH_TOKEN='{FAKE_TOKEN}'\n")], changed)
+        for path in self.run_dir.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(self.OLD_TOKEN, path.read_text(encoding="utf-8"),
+                                 f"the spent token is still in {path}")
+
+    def test_a_token_valid_beyond_the_margin_is_used_and_nothing_is_minted(self):
+        self._token_file(self._stamp(3600))
+        http = _FakeHttp()
+        self.assertEqual(self.OLD_TOKEN, self._fresh(http))
+        self.assertEqual([], http.calls, "a token still good for the margin was minted again")
+        self.assertEqual(self.env_before, (self.run_dir / "env").read_text(encoding="utf-8"))
+
+    def test_a_token_inside_the_margin_is_replaced_in_the_token_file_and_the_env_file(self):
+        self._token_file(self._stamp(120))
+        http = _FakeHttp()
+        self._assert_replaced(self._fresh(http), http)
+
+    def test_a_token_past_its_expiry_is_replaced(self):
+        self._token_file(self._stamp(-60))
+        http = _FakeHttp()
+        self._assert_replaced(self._fresh(http), http)
+
+    def test_an_expiry_that_cannot_be_read_is_treated_as_spent(self):
+        self._token_file("not a timestamp")
+        http = _FakeHttp()
+        self._assert_replaced(self._fresh(http), http)
+
+    def test_a_mint_that_fails_raises_and_leaves_the_run_as_it_was(self):
+        import harness.token
+
+        self._token_file(self._stamp(-60))
+        before = (self.run_dir / "token").read_text(encoding="utf-8")
+
+        def refusing(*_args, **_kwargs):
+            raise harness.token.TokenError("GitHub refused the installation token (401)")
+
+        with self.assertRaises(harness.token.TokenError):
+            self._fresh(refusing)
+        self.assertEqual(before, (self.run_dir / "token").read_text(encoding="utf-8"))
+        self.assertEqual(self.env_before, (self.run_dir / "env").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

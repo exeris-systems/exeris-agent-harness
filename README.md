@@ -19,9 +19,10 @@ is:
 - a **token** the identity minted for itself, good for an hour, scoped to the organisation over
   https and to nothing else. A run that cannot mint it fails; it never falls back to a person's
   credential, and where the helper does not answer, git fails instead of asking the terminal. A run
-  that outlives the hour is reopened rather than refreshed, and `status` carries each run's expiry
-  so that the end of a long one is a line on the listing rather than a push refused for reasons of
-  its own.
+  that outlives the hour has its token minted again by `close-run` before it acts as the identity —
+  written over `<run>/token`, which the credential helper reads, and over the `GH_TOKEN` line of
+  `<run>/env` — and `status` carries each run's expiry, because a shell that sourced the env file
+  earlier still holds the token it sourced.
 - a **git configuration** bound to the tree: the identity's `user.*`, a credential helper that
   answers for one organisation, ssh remotes rewritten to https before git resolves them, and
   signing off. It is bound at worktree scope, which git reads after the repository's own config,
@@ -35,8 +36,9 @@ is:
   declared together in one `[providers.<name>]` table. `--provider` names that table, so the vendor
   the row records, the ledger it is billed to and the snapshot of the weights that ran are what the
   arm declared and not what the repository happened to be configured with.
-- a **manifest** saying what the run is — task, repository, arm, branch, base commit, the
-  accountable owner, and the principal that will act.
+- a **manifest** saying what the run is — task, repository, arm, branch, base commit, whether the
+  tree it was created as held uncommitted changes, the accountable owner, and the principal that
+  will act.
 - a **record**, written when the run closes: one row in the shape of the layer's row contract,
   saying what the run was, what it did and under what conditions — and never what it produced. A
   value the run could not establish is not defaulted; where one is missing there is no row, and the
@@ -149,7 +151,23 @@ with no bundle pin, a client version (or, on a local arm, a set of weights) no f
 for, a group whose human arm was never measured — the push and the pull request stand and the
 reason is printed.
 
-`flush` acts **as the person**: their own `gh`, their own git. It carries the session streams into
+The row's `repository_state` is the tree the run **started** on — the base commit, the bundle it
+pinned, and the `start_dirty` the manifest recorded when the worktree was created — so it is the
+same for every arm of a group. What an arm left uncommitted is not on the row: it is
+`left_uncommitted` in `staging/closed.json`, and it is what keeps `--remove-worktree` from giving
+such a tree back.
+
+`close-run --run <ULID> --restage` rebuilds the staged row of a run that is closed and not yet
+flushed, with the derivation now in force, from what the close recorded: the manifest, the staged
+stream, the commits the row named, the staged judgement, the visibility and the moment of the close.
+It pushes nothing, asks nothing of the forge, needs no token and does not touch the tree; the staged
+stream is left byte for byte, a reference an earlier flush resolved is kept, and each field that
+changed is printed. A run that is open, that staged no row, or whose row the execution clone already
+holds — in its working tree or on any of its refs — is refused.
+
+`flush` acts **as the person**: their own `gh`, their own git. It first fetches both clones it
+commits into and fast-forwards each to its remote — other producers push there — and refuses a
+clone whose branch holds commits its remote does not. It carries the session streams into
 the streams repository, resolves each staged row's reference to the commit that now holds its
 stream, runs the inbox's own validator over the batch, and opens one pull request against the
 inbox. A red validator commits nothing and asks for nothing — a defect is fixed at the producer,
