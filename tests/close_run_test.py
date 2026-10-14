@@ -666,6 +666,34 @@ class CloseRunTest(support.HarnessFixture):
         self.assertIn("flushed", self.said)
         self.assertEqual(before, path.read_bytes())
 
+    def test_restage_refuses_a_row_filed_from_another_clone_since_the_last_fetch(self):
+        path, _ = self._closed_without_left_uncommitted()
+        date = path.parent.parent.name
+        other = self.tmp / "another-machine"
+        self.git("clone", "-q", str(self.tmp / "exeris-ai-execution.git"), str(other))
+        target = other / "inbox" / date / "runs" / path.name
+        target.parent.mkdir(parents=True)
+        target.write_bytes(path.read_bytes())
+        self.git("add", "-A", cwd=other)
+        self.git("-c", "user.name=Another Machine", "-c", "user.email=other@example.invalid",
+                 "commit", "-m", "feat(inbox): the row another flush carried", cwd=other)
+        self.git("push", "-q", "origin", "HEAD:refs/heads/inbox/harness/elsewhere", cwd=other)
+        before = path.read_bytes()
+
+        self.assertEqual(2, self._restage())
+        self.assertIn("flushed", self.said)
+        self.assertEqual(before, path.read_bytes())
+
+    def test_restage_refuses_when_the_execution_clone_cannot_fetch(self):
+        path, _ = self._closed_without_left_uncommitted()
+        self.git("remote", "set-url", "origin", str(self.tmp / "no-such-remote.git"),
+                 cwd=self.execution)
+        before = path.read_bytes()
+
+        self.assertEqual(2, self._restage())
+        self.assertIn("could not fetch", self.said)
+        self.assertEqual(before, path.read_bytes())
+
     def test_restage_refuses_a_run_whose_manifest_does_not_record_the_start_state(self):
         path, _ = self._closed_without_left_uncommitted()
         self._forget_start_state()

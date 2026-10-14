@@ -1008,7 +1008,14 @@ def _filed(net, execution: str, date: str, run_id: str) -> str | None:
     `flush` leaves staging in place and copies each row it carries into the inbox, so a staged row
     that has been flushed is told apart by the inbox side: the path in the clone's working tree, or
     a commit on any of its refs — the batch branch a flush pushed is one of them — that touched it.
+    The clone fetches its remote first: a row another machine's flush filed is on the remote's
+    refs, not yet on this clone's, and a clone that cannot fetch cannot say a row is unfiled.
     """
+    try:
+        net.git(execution, "fetch", "--quiet", "origin")
+    except CommandError as exc:
+        raise Refused(f"{execution} could not fetch its remote, so whether the row is already "
+                      f"filed cannot be established: {exc}") from None
     inside = f"inbox/{date}/runs/{run_id}.json"
     if os.path.exists(os.path.join(execution, inside)):
         return os.path.join(execution, inside)
