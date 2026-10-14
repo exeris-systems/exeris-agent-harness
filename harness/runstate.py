@@ -87,9 +87,11 @@ def write_text(run_dir: str, name: str, text: str, mode: int = SECRET_MODE) -> s
     target = os.path.join(run_dir, name)
     os.makedirs(os.path.dirname(target), mode=DIR_MODE, exist_ok=True)
     descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    # On the open file and before the text: a file that already existed with a wider mode is
+    # narrowed before it holds what is written now.
+    os.fchmod(descriptor, mode)
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         handle.write(text)
-    os.chmod(target, mode)
     return target
 
 

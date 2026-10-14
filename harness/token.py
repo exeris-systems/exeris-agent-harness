@@ -218,10 +218,12 @@ def write(run_dir: str, minted: dict) -> str:
 
     One value per line rather than JSON, because the credential helper that reads it is a shell
     one-liner and a parser in that position is a dependency the run does not need. 0600 because the
-    file is a bearer credential for as long as the hour lasts.
+    file is a bearer credential for as long as the hour lasts — set on the open file before the
+    token is written, so a file that already existed with a wider mode never holds a new token.
     """
     path = os.path.join(run_dir, "token")
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, KEY_MODE)
+    os.fchmod(descriptor, KEY_MODE)
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         handle.write(f"{minted['token']}\n{minted.get('expires_at', '')}\n")
     return path

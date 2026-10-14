@@ -590,6 +590,14 @@ class HarnessFixture(unittest.TestCase):
             out.append((endpoint, (method or ("POST" if body else "GET")).upper(), body))
         return out
 
+    def gh_argvs(self):
+        """The command line of every `gh` invocation, as the fake recorded it."""
+        path = self.gh_state / "calls.jsonl"
+        if not path.is_file():
+            return []
+        return [json.loads(line)["argv"] for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip()]
+
     def posted_pulls(self):
         return [body for endpoint, method, body in self.gh_calls()
                 if method == "POST" and str(endpoint).endswith("/pulls")]

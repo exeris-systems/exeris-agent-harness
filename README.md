@@ -153,7 +153,9 @@ reason is printed.
 
 The row's `repository_state` is the tree the run **started** on — the base commit, the bundle it
 pinned, and the `start_dirty` the manifest recorded when the worktree was created — so it is the
-same for every arm of a group. What an arm left uncommitted is not on the row: it is
+same for every arm of a group. A manifest that does not record `start_dirty` yields no row
+(`start-state-unrecorded`): the state is not established anywhere else, and the row cannot carry
+it absent. What an arm left uncommitted is not on the row: it is
 `left_uncommitted` in `staging/closed.json`, and it is what keeps `--remove-worktree` from giving
 such a tree back.
 
@@ -162,12 +164,14 @@ flushed, with the derivation now in force, from what the close recorded: the man
 stream, the commits the row named, the staged judgement, the visibility and the moment of the close.
 It pushes nothing, asks nothing of the forge, needs no token and does not touch the tree; the staged
 stream is left byte for byte, a reference an earlier flush resolved is kept, and each field that
-changed is printed. A run that is open, that staged no row, or whose row the execution clone already
-holds — in its working tree or on any of its refs — is refused.
+changed is printed. A run that is open, that staged no row, whose manifest does not record
+`start_dirty`, or whose row the execution clone already holds — in its working tree or on any of
+its refs — is refused.
 
-`flush` acts **as the person**: their own `gh`, their own git. It first fetches both clones it
-commits into and fast-forwards each to its remote — other producers push there — and refuses a
-clone whose branch holds commits its remote does not. It carries the session streams into
+`flush` acts **as the person**: their own `gh`, their own git. With no rows staged it does nothing.
+Otherwise it first fetches both clones it commits into and fast-forwards each to its remote — other
+producers push there — and refuses a clone with no branch checked out, one on a branch its remote
+does not have, and one whose branch holds commits its remote does not. It carries the session streams into
 the streams repository, resolves each staged row's reference to the commit that now holds its
 stream, runs the inbox's own validator over the batch, and opens one pull request against the
 inbox. A red validator commits nothing and asks for nothing — a defect is fixed at the producer,

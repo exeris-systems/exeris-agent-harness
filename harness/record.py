@@ -11,6 +11,7 @@ as it applies to a producer: a convenient default is indistinguishable from a me
 is in the column, and the column is what a later comparison averages.
 """
 
+import collections
 import datetime
 import hashlib
 import json
@@ -193,6 +194,10 @@ def fence(execution_repo: str, provider: str, client_version: str,
     return entries[0]
 
 
+#: The mark a stream reference carries in place of a commit until a flush resolves it.
+PENDING = "@pending"
+
+
 def stream_ref(org: str, streams_repo: str, date: str, repo: str, run_id: str) -> str:
     """Where the run's stream will be, pending the commit that puts it there.
 
@@ -200,7 +205,7 @@ def stream_ref(org: str, streams_repo: str, date: str, repo: str, run_id: str) -
     no commit to name. It is resolved in staging, before a row reaches an inbox — the rule that a
     record is never rewritten begins where records are kept, and staging is the producer's own.
     """
-    return f"{org}/{streams_repo}/streams/{date}/{repo}/{run_id}.jsonl@pending"
+    return f"{org}/{streams_repo}/streams/{date}/{repo}/{run_id}.jsonl{PENDING}"
 
 
 def bundle_version(manifest: str | None, source: str = BUNDLE_MANIFEST) -> str:
@@ -448,14 +453,30 @@ def capture_version(execution_repo: str) -> str:
     return value
 
 
-def inbox_pull_request_body(rows: int, date: str, repositories) -> str:
+def _filed_under(dates: list) -> str:
+    """Where a batch's rows are filed: one directory, or every one of them with its count.
+
+    A row is filed under the date its run started, so one batch can span several directories.
+    """
+    counts = collections.Counter(dates)
+    if len(counts) == 1:
+        return f"under `inbox/{next(iter(counts))}/runs/`"
+    parts = [f"{counts[date]} under `inbox/{date}/runs/`" for date in sorted(counts)]
+    return "— " + ", ".join(parts[:-1]) + f" and {parts[-1]}"
+
+
+def inbox_pull_request_body(dates, repositories) -> str:
     """The body of the pull request that carries a batch of rows into the inbox.
+
+    `dates` holds the date directory of each row in the batch, one entry per row.
 
     It carries no `Owner:` line, and that is the rule rather than an omission: the line is required
     on a pull request the execution identity authored and forbidden on every other, and this one is
     opened by the person whose sign-off the batch is. The classification is answered rather than
     left as placeholders for the same reason — this is not a draft somebody else will finish.
     """
+    dates = list(dates)
+    rows = len(dates)
     named = ", ".join(sorted(set(repositories))) or "none"
     return "\n".join([
         "Motivation:",
@@ -463,8 +484,8 @@ def inbox_pull_request_body(rows: int, date: str, repositories) -> str:
         f"unless something carries them in, and the producer validates them before it asks.",
         "",
         "Modification:",
-        f"{rows} run record(s) under `inbox/{date}/runs/`, one file per record, named by the id "
-        f"inside it. Source repositories: {named}.",
+        f"{rows} run record(s) {_filed_under(dates)}, one file per record, named by the id inside "
+        f"it. Source repositories: {named}.",
         "",
         "Result:",
         "The rows are in the inbox and nothing reads them. No aggregation, no comparison, no "

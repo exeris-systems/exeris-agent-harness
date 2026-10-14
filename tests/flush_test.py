@@ -319,6 +319,49 @@ class FlushTest(support.HarnessFixture):
         self.assertEqual(2, self._flush(), "a flush committed on top of an unpushed commit")
         self.assertEqual([], self._on_branch())
 
+    def test_an_empty_flush_reads_no_clone_and_fetches_nothing(self):
+        self._committed_locally(self.execution)
+        self._pushed_elsewhere("exeris-ai-execution-streams")
+        before = self.git("rev-parse", "refs/remotes/origin/main", cwd=self.streams).stdout.strip()
+
+        self.assertEqual(0, self._flush(), self.said)
+        self.assertIn("no rows staged", self.said)
+        self.assertEqual(before, self.git("rev-parse", "refs/remotes/origin/main",
+                                          cwd=self.streams).stdout.strip(),
+                         "an empty flush fetched")
+
+    def test_a_clone_with_no_branch_checked_out_is_refused(self):
+        self._staged_run()
+        self.git("checkout", "-q", "--detach", cwd=self.streams)
+
+        self.assertEqual(2, self._flush(), "a flush committed onto a detached HEAD")
+        self.assertIn("no branch checked out", self.said)
+        self.assertIn("@pending", self.staged_rows()[0].read_text())
+
+    def test_a_clone_on_a_branch_origin_does_not_have_is_refused(self):
+        self._staged_run()
+        self.git("checkout", "-q", "-b", "somebody-s-topic", cwd=self.execution)
+
+        self.assertEqual(2, self._flush(), "a flush committed onto a branch origin lacks")
+        self.assertIn("which origin does not have", self.said)
+        self.assertEqual([], self._on_branch())
+
+    # ---- the pull request body ---------------------------------------------------
+
+    def test_the_body_names_every_date_directory_a_batch_spans(self):
+        import harness.record
+
+        body = harness.record.inbox_pull_request_body(
+            ["2026-10-14", "2026-10-13", "2026-10-14", "2026-10-14"], ["exeris-agent-harness"])
+        self.assertIn("4 run record(s) — 1 under `inbox/2026-10-13/runs/` and 3 under "
+                      "`inbox/2026-10-14/runs/`", body)
+
+    def test_the_body_of_a_batch_on_one_date_names_that_directory(self):
+        import harness.record
+
+        body = harness.record.inbox_pull_request_body(["2026-10-14", "2026-10-14"], ["a"])
+        self.assertIn("2 run record(s) under `inbox/2026-10-14/runs/`,", body)
+
     def test_references_an_earlier_flush_resolved_are_counted_as_resolved(self):
         self._staged_run()
         path = self.staged_rows()[0]

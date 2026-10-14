@@ -408,6 +408,48 @@ class CloseRunTest(support.HarnessFixture):
                 self.assertNotIn(self.OLD_TOKEN.encode(), path.read_bytes(),
                                  f"the spent token is still in {path}")
 
+    def test_a_renewed_token_is_written_to_files_only_the_owner_can_read(self):
+        import stat
+
+        self.open_run()
+        self.commit()
+        self.place_session()
+        self._spend_token("2020-01-01T00:00:00Z")
+        for name in ("token", "env"):
+            (self.run_dir() / name).chmod(0o644)
+
+        self.assertEqual(0, self._close())
+
+        self.assertIn(support.FAKE_TOKEN, (self.run_dir() / "token").read_text(encoding="utf-8"))
+        for name in ("token", "env"):
+            self.assertEqual(0o600, stat.S_IMODE((self.run_dir() / name).stat().st_mode),
+                             f"<run>/{name} holds the renewed token and others can read it")
+
+    def test_a_renewed_token_is_in_no_command_line(self):
+        import subprocess
+        from unittest import mock
+
+        self.open_run()
+        self.commit()
+        self.place_session()
+        self._spend_token("2020-01-01T00:00:00Z")
+        argvs = []
+        real_run = subprocess.run
+
+        def recording(args, *rest, **kwargs):
+            argvs.append([str(arg) for arg in (args if isinstance(args, (list, tuple))
+                                               else [args])])
+            return real_run(args, *rest, **kwargs)
+
+        with mock.patch("subprocess.run", recording):
+            self.assertEqual(0, self._close())
+
+        self.assertTrue(any("push" in argv for argv in argvs), "the close pushed nothing")
+        self.assertTrue(self.gh_argvs(), "the fake gh recorded no call")
+        for argv in argvs + self.gh_argvs():
+            self.assertFalse(any(support.FAKE_TOKEN in arg for arg in argv),
+                             f"the renewed token is on a command line: {argv[:3]}")
+
     def test_a_token_past_its_expiry_is_minted_again_before_the_push(self):
         self.open_run()
         self.commit()
@@ -468,18 +510,27 @@ class CloseRunTest(support.HarnessFixture):
         self.assertTrue((tree / "left-behind.txt").exists(),
                         "a tree holding uncommitted work was given back")
 
-    def test_a_manifest_from_before_the_start_state_was_recorded_reads_as_clean(self):
-        self.open_run()
+    def _forget_start_state(self):
+        """The run's manifest with no `start_dirty`."""
         manifest_path = self.run_dir() / "manifest.json"
         manifest = json.loads(manifest_path.read_text())
         manifest.pop("start_dirty")
         manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+    def test_a_manifest_that_does_not_record_the_start_state_yields_no_row(self):
+        self.open_run()
+        self._forget_start_state()
         self.commit()
         self.place_session()
-        (self.worktree() / "left-behind.txt").write_text("work the arm never committed\n")
 
-        self.assertEqual(0, self._close())
-        self.assertIs(False, self.staged_row()["repository_state"]["dirty"])
+        noticed = io.StringIO()
+        with contextlib.redirect_stderr(noticed):
+            self.assertEqual(0, self._close())
+        self.assertEqual([], self.staged_rows())
+        self.assertIn("start-state-unrecorded", noticed.getvalue())
+        self.assertEqual("start-state-unrecorded", self._closed()["reason"])
+        self.assertIs(False, self._closed()["row"])
+        self.assertEqual(1, len(self.posted_pulls()), "the pull request stands without a row")
 
     def test_a_tree_that_started_dirty_is_recorded_dirty(self):
         self.open_run()
@@ -503,8 +554,9 @@ class CloseRunTest(support.HarnessFixture):
         self.said = out.getvalue() + noticed.getvalue()
         return code
 
-    def _closed_the_old_way(self):
-        """A run closed while the row's `dirty` was the state the arm left the tree in."""
+    def _closed_without_left_uncommitted(self):
+        """A closed run whose staged row has `dirty: true` and whose `closed.json` has no
+        `left_uncommitted`."""
         self._closed_run()
         path = self.staged_rows()[0]
         row = json.loads(path.read_text())
@@ -517,7 +569,7 @@ class CloseRunTest(support.HarnessFixture):
         return path, row
 
     def test_restage_rebuilds_the_row_and_leaves_the_stream_as_it_was(self):
-        path, before = self._closed_the_old_way()
+        path, before = self._closed_without_left_uncommitted()
         stream = self.staged_streams()[0]
         stream_bytes = stream.read_bytes()
         calls = len(self.gh_calls())
@@ -539,7 +591,7 @@ class CloseRunTest(support.HarnessFixture):
                                           cwd=self.origin).stdout.strip())
 
     def test_restage_keeps_a_reference_an_earlier_flush_resolved(self):
-        path, _ = self._closed_the_old_way()
+        path, _ = self._closed_without_left_uncommitted()
         row = json.loads(path.read_text())
         resolved = row["execution"]["event_stream"]["ref"].replace("@pending", "@" + "a" * 40)
         row["execution"]["event_stream"]["ref"] = resolved
@@ -564,7 +616,7 @@ class CloseRunTest(support.HarnessFixture):
         self.assertIn("no row staged", self.said)
 
     def test_restage_refuses_a_row_already_in_the_inbox(self):
-        path, _ = self._closed_the_old_way()
+        path, _ = self._closed_without_left_uncommitted()
         date = path.parent.parent.name
         target = self.execution / "inbox" / date / "runs" / path.name
         target.parent.mkdir(parents=True)
@@ -578,8 +630,28 @@ class CloseRunTest(support.HarnessFixture):
         self.assertIn("flushed", self.said)
         self.assertEqual(before, path.read_bytes())
 
+    def test_restage_refuses_a_run_whose_manifest_does_not_record_the_start_state(self):
+        path, _ = self._closed_without_left_uncommitted()
+        self._forget_start_state()
+        before = path.read_bytes()
+        closed_before = (self.run_dir() / "staging" / "closed.json").read_bytes()
+
+        self.assertEqual(2, self._restage())
+        self.assertIn("start-state-unrecorded", self.said)
+        self.assertEqual(before, path.read_bytes())
+        self.assertEqual(closed_before, (self.run_dir() / "staging" / "closed.json").read_bytes())
+
+    def test_restage_does_not_fill_left_uncommitted_from_a_row_without_dirty(self):
+        path, row = self._closed_without_left_uncommitted()
+        row["repository_state"].pop("dirty")
+        path.write_text(json.dumps(row, indent=2, sort_keys=True) + "\n")
+
+        self.assertEqual(0, self._restage(), self.said)
+        self.assertNotIn("left_uncommitted", self._closed())
+        self.assertIs(False, json.loads(path.read_text())["repository_state"]["dirty"])
+
     def test_restage_takes_nothing_but_the_run(self):
-        self._closed_the_old_way()
+        self._closed_without_left_uncommitted()
         self.assertEqual(2, self._restage("--no-pr"))
 
     def _refusing_gh(self):
