@@ -59,10 +59,10 @@ jobs:
   # parts, one model run each, composed into one verdict: `pr` and `repo` on every pull request
   # (the suite runs in the `repo` leg alone), the others where the diff has their files. A part
   # that leaves no verdict makes the check red.
-  docs-review:
+  review:
     needs: [docs, commits, pr-body]
     if: ${{ always() && github.event.action != 'closed' }}
-    uses: exeris-systems/.github/.github/workflows/docs-review.yml@main
+    uses: exeris-systems/.github/.github/workflows/review.yml@main
     with:
       publish: true
       review-in-parts: true
