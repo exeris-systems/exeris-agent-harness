@@ -65,6 +65,22 @@ jobs:
     uses: exeris-systems/.github/.github/workflows/review.yml@main
     with:
       publish: true
+      # CAPTURE IS THE SECOND OPT-IN, and a separate decision from the first. With it on, the run
+      # becomes a row in the organisation's execution dataset (ADR-087 §C.13-§C.17): the runner's
+      # execution log is committed to the streams repository as content, a run record is assembled
+      # from what the producing job exported about itself, and the day's rows reach the inbox as
+      # one pull request per repository per day.
+      #
+      # IT RUNS INSIDE THE PUBLISHING HALF, so it needs `publish: true` as well: with publication
+      # off there is no job for it to be a part of, and `capture: true` alone runs nothing and
+      # says nothing about having run nothing.
+      #
+      # It needs the two EXERIS_INBOX_* secrets below and NO new permission: the capture job reads
+      # the repository and the pull request, both of which the block at the top already grants, and
+      # every write goes through the App's installation token. Without the secrets the job reports
+      # that it has no identity to write under and writes nothing; the review and its gate are
+      # unaffected either way.
+      capture: true
       review-in-parts: true
       l1-results: >-
         {"docs-lint": "${{ needs.docs.result }}",
@@ -78,6 +94,16 @@ jobs:
       claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       exeris_bot_app_id: ${{ secrets.EXERIS_BOT_APP_ID }}
       exeris_bot_private_key: ${{ secrets.EXERIS_BOT_PRIVATE_KEY }}
+      # THE PEN, which `capture: true` above writes with. A caller may pass only a secret the called
+      # workflow DECLARES: one it does not declare is not ignored, it makes the whole file an
+      # invalid workflow in the adopting repository, on the first push, with no logs — taking every
+      # gate in this file down with it, not only this job.
+      #
+      # They are optional exactly as the two lines above are: an organisation secret that is not set
+      # arrives as an empty string, and the capture job then says so and writes nothing. They are
+      # named rather than inherited for the reason the others are.
+      exeris_inbox_app_id: ${{ secrets.EXERIS_INBOX_APP_ID }}
+      exeris_inbox_private_key: ${{ secrets.EXERIS_INBOX_PRIVATE_KEY }}
 
   # Once the pull request has closed, what became of each finding is read from its history and
   # appended beside the run record as a judgement (ADR-087 §C.16).
@@ -87,3 +113,5 @@ jobs:
     secrets:
       exeris_bot_app_id: ${{ secrets.EXERIS_BOT_APP_ID }}
       exeris_bot_private_key: ${{ secrets.EXERIS_BOT_PRIVATE_KEY }}
+      exeris_inbox_app_id: ${{ secrets.EXERIS_INBOX_APP_ID }}
+      exeris_inbox_private_key: ${{ secrets.EXERIS_INBOX_PRIVATE_KEY }}
